@@ -147,6 +147,8 @@ def process_limb(in_paths, save_paths, overwrite):
         sample_rate = 100
         fs = sample_rate
 
+        emg_channels = siganl_emg.shape[0] 
+
         dur_samples_below_count = int(np.ceil(0.05 * sample_rate))
         lower_threshold_uV = 2
         upper_threshold_uV = 10
@@ -161,7 +163,7 @@ def process_limb(in_paths, save_paths, overwrite):
         LM_line = []
 
         LM = []
-        for ch in range(1):
+        for ch in range(emg_channels):
             filtered_data.append(signal_emg[ch, :])
             order = filter_order
             w = filter_hp_freq_Hz
