@@ -251,6 +251,11 @@ Click: [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/bd
 
 ![D35F6B1D-5683-4681-A955-B974823B4886](https://github.com/user-attachments/assets/5a9bd25f-f4ce-4df9-bb34-6384766c196a)
 
+## Citation
+Please make sure to cite the following paper if you use CAISR in any of your work
+
+> Nasiri, S., Ganglberger, W., Nassi, T., Meulenbrugge, E. J., Moura Junior, V., Ghanta, M., ... & Westover, M. B. (2025).
+> CAISR: Achieving Human-Level Performance in Automated Sleep Analysis Across All Clinical Sleep Metrics. Sleep, zsaf134.
 
 ## Contact & Support
 For support or inquiries, please open an issue on GitHub. If you have any questions or need clarification, the CAISR development team can be contacted via:
