@@ -184,6 +184,124 @@ The numerical - per sample - output of CAISR is stored
 
  in `caisr_output/combined/`, containing the sleep stage hypnogram, the respiratory events, arousal events, and limb movement events. These output CSV files are saved at 2 Hz.
 
+**Path:** `caisr_annotations/caisr_{study_id}.csv`
+
+This file contains the per-sample time series output of CAISR.  
+**One row = one timestamp**, and the file represents the **combined output** of all four CAISR sub-models:
+
+- Sleep staging
+- Arousal detection
+- Respiratory event detection
+- Limb movement detection
+
+Sample Frequency: 2 Hz (one row = 0.5 seconds)
+
+The saved output is **2 Hz**.
+
+- Internal processing runs at **200 Hz**, and the final combined annotation file is **downsampled by taking every 100th sample**.  
+  - `README.md:183-186`  
+  - `caisr_report.py:177-178`
+
+---
+
+#### Columns and Their Coding
+
+##### Index columns
+
+| Column     | Description |
+|-----------|-------------|
+| `start_idx` | Start sample index in the **200 Hz** source `.h5` file |
+| `end_idx`   | End sample index in the **200 Hz** source `.h5` file |
+
+These columns are retained from the arousal task output and placed at the front of the combined file.  
+- `caisr_report.py:153-175`
+
+---
+
+#### Sleep Stage columns (`stage`, `stage_prob_*`)
+
+##### `stage` codes
+
+| Value | Meaning |
+|------:|---------|
+| 1 | N3 (Deep Sleep) |
+| 2 | N2 |
+| 3 | N1 (Light Sleep) |
+| 4 | REM |
+| 5 | Wake |
+| 9 | No stage (undefined / padded) |
+
+##### Stage per-class probabilities (0.0–1.0)
+
+The staging model also outputs per-class probabilities stored as floats in **[0.0, 1.0]**, rounded to **5 decimal places**:
+
+| Column | Meaning |
+|--------|---------|
+| `stage_prob_n3` | Probability of N3 |
+| `stage_prob_n2` | Probability of N2 |
+| `stage_prob_n1` | Probability of N1 |
+| `stage_prob_r`  | Probability of REM |
+| `stage_prob_w`  | Probability of Wake |
+
+---
+
+#### Arousal columns (`arousal`, `arousal_prob_*`, `arousal_pp_trace`)
+
+| Column | Values | Meaning |
+|--------|--------|---------|
+| `arousal` | 0 or 1 | 0 = no arousal, 1 = arousal event |
+| `arousal_prob_no` | 0.0–1.0 | Model probability of no arousal |
+| `arousal_prob_arousal` | 0.0–1.0 | Model probability of arousal |
+| `arousal_pp_trace` | 0 or 1 | Post-processed arousal trace (binary) |
+
+---
+
+#### Respiratory event column (`resp`)
+
+The `resp` column uses integer codes:
+
+| Value | Meaning |
+|------:|---------|
+| 0 | No event |
+| 1 | Obstructive Apnea (OA) |
+| 2 | Central Apnea (CA) |
+| 3 | Mixed Apnea (MA) |
+| 4 | Hypopnea (HY) |
+| 5 | Respiratory Effort-Related Arousal (RERA) |
+
+This coding is confirmed in both the visualization code and AHI computation logic:  
+- `caisr_report.py:676-686`  
+- `sleep_indices.py:26-40`
+
+---
+
+#### Limb movement column (`limb`)
+
+| Value | Meaning |
+|------:|---------|
+| 0 | No limb movement |
+| 1 | Isolated limb movement |
+| 2 | Periodic limb movement (PLM) |
+
+Notes:
+- The `prob_no` and `prob_limb` columns from the intermediate limb file are dropped before saving the combined output.
+- The `plm` column is also dropped at this stage.  
+  - `caisr_report.py:171`
+
+The limb coding is also confirmed by the LMI/PLMI computation logic, which:
+- treats values **1, 2, and 4** as limb movements
+- treats **2** as periodic  
+- `sleep_indices.py:122-127`
+
+---
+
+#### Missing data and storage rules
+
+- Any `NaN` values in **any** column are replaced with **`9`** before saving.  
+- **Non-probability columns** are stored as **integers**.  
+- **Probability columns** are stored as **floats**, rounded to **5 decimal places**.  
+  - `caisr_report.py:160-169`
+
 ---
 
 ### Report Generation
