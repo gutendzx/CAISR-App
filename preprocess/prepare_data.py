@@ -154,8 +154,8 @@ def standardize_channel_names(signal, verbose=False):
     rename_rules = {
         'ecg': ['ekg', 'ecg-la', 'ecg-v1', 'ecg l', 'ecgl', 'ecg ii'],
         'spo2': ['sao2', 'osat', 'o2sat', 'o2 sat', 'o2-sat', 'o2-saturation'],
-        'e2-m1': ['e2-m2', 'loc', 'eog(r)', 'eog-r', 'eog r', 'eog2', 'rt eye (e2)', 'rt. eye (e2)', 'rt. eye (e2)', 'lt. eye (e1)', 'eog loc-a2'],
-        'e1-m2': ['e1-m1', 'roc', 'eog(l)', 'eog-l', 'eog l', 'eog1', 'lt eye (e1)', 'lt. eye (e1)', 'lt. eye (e1)', 'rt. eye (e2)', 'eog roc-a2'],
+        'e2-m1': ['e2-m2', 'loc', 'eog(r)', 'eog-r', 'eog r', 'eog2', 'rt eye (e2)', 'rt. eye (e2)', 'rt. eye (e2)', 'eog roc-a2'],
+        'e1-m2': ['e1-m1', 'roc', 'eog(l)', 'eog-l', 'eog l', 'eog1', 'lt eye (e1)', 'lt. eye (e1)', 'lt. eye (e1)', 'eog loc-a2'],
         'hr': ['heart rate', 'heartrate', 'h.r.'],
         'f3-m2': ['f3m2', 'f3-m2+m1', 'eeg f3-a2'],
         'f4-m1': ['f4m1', 'f4-m1+m2', 'eeg f4-a1'],
