@@ -66,9 +66,9 @@ CAISR expects a certain minimum number of channels to be available. The algorith
 
 - **EEG (Electroencephalogram)**:
   - At least one EEG is required, named either:  
-    `f3-m2`, `f2-m1`, `c3-m2`, `c4-m1`, `o1-m2`, `o2-m1`, or `eeg`.
+    `f3-m2`, `f4-m1`, `c3-m2`, `c4-m1`, `o1-m2`, `o2-m1`, or `eeg`.
   - CAISR performs best when six EEG channels are provided:  
-    `f3-m2`, `f2-m1`, `c3-m2`, `c4-m1`, `o1-m2`, `o2-m1`.
+    `f3-m2`, `f4-m1`, `c3-m2`, `c4-m1`, `o1-m2`, `o2-m1`.
 
 - **EOG (Electrooculogram)**:
   - At least one EOG is required, named either:  
