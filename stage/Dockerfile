@@ -38,6 +38,8 @@ RUN curl -LO "http://repo.continuum.io/miniconda/Miniconda3-${CONDA_VER}-Linux-$
 RUN bash Miniconda3-${CONDA_VER}-Linux-${OS_TYPE}.sh -p /miniconda -b
 RUN rm Miniconda3-${CONDA_VER}-Linux-${OS_TYPE}.sh
 ENV PATH=/miniconda/bin:${PATH}
+RUN conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+RUN conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
 RUN conda update -y conda
 
 # Set directory and copy required files and folders
