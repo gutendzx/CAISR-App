@@ -147,7 +147,7 @@ def process_limb(in_paths, save_paths, overwrite):
         sample_rate = 100
         fs = sample_rate
 
-        emg_channels = siganl_emg.shape[0] 
+        emg_channels = signal_emg.shape[0] 
 
         dur_samples_below_count = int(np.ceil(0.05 * sample_rate))
         lower_threshold_uV = 2
