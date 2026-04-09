@@ -360,6 +360,7 @@ You can optionally clean up Docker images and containers after running the tasks
 ## Troubleshooting
 - **Docker Not Found**: Ensure Docker is installed and running. Check by running `docker --version`.
 - **Docker Image Not Found**: Make sure all required Docker images are available in the `dockers/` folder or already installed on your system.
+- **Apple Silicon (M1/M2/M3/M4)**: The Docker images require x86_64 emulation which is slow and may fail. For native Apple Silicon support without Docker, see [caisr-native](https://github.com/redareda9/caisr-native).
 
 ## License
 This project is free to use for non-commercial purposes. For commercial use, please contact us directly.
