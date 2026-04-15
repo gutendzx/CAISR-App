@@ -1,100 +1,73 @@
-import os, ray, time, logging, argparse
+"""
+CAISR Resp: Respiratory Event Detection
+Author: Thijs Nassi, PhD
+Cleaned/Refactored for Public Repository
+
+Description:
+    Runs rule-based respiratory event detection (Apnea, Hypopnea, RERA).
+    Uses Ray for parallel processing.
+"""
+
+import os
+import ray
+import time
+import logging
+import argparse
+import glob
 import numpy as np
 import pandas as pd
 from typing import List, Tuple
 
-# import algorithm functions
+# --- Local Imports ---
+# Ensure 'resp' folder exists
 from resp.rule_based_functions.SpO2_drop_analysis import *
 from resp.rule_based_functions.Ventilation_drop_analysis import *
 from resp.rule_based_functions.Hypopnea_analysis import *
 from resp.rule_based_functions.RERA_analysis import *
 from resp.rule_based_functions.Resp_event_hierarchy import *
 from resp.rule_based_functions.Post_processing import *
-
-# import utils functions
 from resp.utils_functions.Data_loaders import *
 from resp.utils_functions.Data_writers import *
 
-# Input formatting functions
 def timer(tag: str) -> None:
-    """
-    Displays a simple progress bar for the given tag, printing dots incrementally for aesthetics.
-    
-    Args:
-    - tag (str): The string label for which the progress bar is shown.
-    """
-
     print(tag)
-    # simple progress bar for aesthetics
     for i in range(1, len(tag) + 1):
         print('.' * i + '     ', end='\r')
-        time.sleep(1.5 / len(tag))  # Time delay proportional to the length of the tag
+        time.sleep(1.5 / len(tag))
     print()
 
-def extract_run_parameters(param_csv: str) -> List[bool]:
-    assert os.path.exists(param_csv), 'run parameter file is not found.'
-    
-    # load run parameters from .csv
+def extract_run_parameters(param_csv: str) -> Tuple[bool, bool]:
+    if not os.path.exists(param_csv):
+        return False, False # Default values
     params = pd.read_csv(param_csv)
     multiprocess = params['multiprocess'].values[0]
     overwrite = params['overwrite'].values[0]
-    
     return multiprocess, overwrite
 
 def set_output_paths(input_paths: List[str], csv_folder: str, raw_folder: str, overwrite: bool) -> Tuple[List[str], List[str], List[str]]:
-    """
-    Sets up output paths for CSV and raw files based on input paths and folders.
-    
-    Args:
-    - input_paths (List[str]): List of input file paths.
-    - csv_folder (str): Folder to save CSV files.
-    - raw_folder (str): Folder to save raw files.
-    - overwrite (bool): Whether to overwrite already processed files.
+    # Create directories
+    resp_csv_dir = os.path.join(csv_folder, 'resp')
+    os.makedirs(resp_csv_dir, exist_ok=True)
+    os.makedirs(raw_folder, exist_ok=True)
 
-    Returns:
-    - Tuple[List[str], List[str], List[str]]: Filtered input paths, CSV paths, and raw paths.
-    """
+    IDs = [p.split(os.sep)[-1].split('.')[0] for p in input_paths]
+    csv_paths = [os.path.join(resp_csv_dir, f'{ID}_resp.csv') for ID in IDs]
+    raw_paths = [os.path.join(raw_folder, f'{ID}.hf5') for ID in IDs]
 
-    total = len(input_paths)
-    # Extract file IDs from input paths
-    IDs = [p.split('/')[-1].split('.')[0] for p in input_paths]
-    # Create corresponding CSV and raw file paths
-    csv_paths = [f'{csv_folder}resp/{ID}_resp.csv' for ID in IDs]
-    raw_paths = [f'{raw_folder}{ID}.hf5' for ID in IDs]
-
-    # Ensure the number of paths is consistent
-    assert len(input_paths) == len(csv_paths) == len(raw_paths), \
-        'SETUP ERROR: The number of input, CSV, and raw files is not equal.'
-
-    # If overwrite is False, filter out already processed files
     input_paths, csv_paths, raw_paths = filter_already_processed_files(input_paths, csv_paths, raw_paths, overwrite)
-
     return input_paths, csv_paths, raw_paths
 
-def filter_already_processed_files(input_paths: List[str], csv_paths: List[str], raw_paths: List[str], overwrite: bool) -> Tuple[List[str], List[str], List[str]]:
-    """
-    Filters out already processed files, unless overwrite is specified.
-    
-    Args:
-    - input_paths (List[str]): List of input file paths.
-    - csv_paths (List[str]): List of CSV output file paths.
-    - raw_paths (List[str]): List of raw output file paths.
-    - overwrite (bool): Whether to overwrite already processed files.
-
-    Returns:
-    - Tuple[List[str], List[str], List[str]]: Updated lists of input, CSV, and raw paths.
-    """
-
+def filter_already_processed_files(input_paths, csv_paths, raw_paths, overwrite):
     total = len(input_paths)
-    todo_indices = [p for p, path in enumerate(csv_paths) if not os.path.exists(path)]
+    todo_indices = [i for i, path in enumerate(csv_paths) if not os.path.exists(path)]
 
-    # If not overwriting, keep only unprocessed files
     if not overwrite:
-        input_paths, csv_paths, raw_paths = filter_todo_files(input_paths, csv_paths, raw_paths, todo_indices)
+        input_paths = np.array(input_paths)[todo_indices].tolist()
+        csv_paths = np.array(csv_paths)[todo_indices].tolist()
+        raw_paths = np.array(raw_paths)[todo_indices].tolist()
 
     tag = '(overwrite) ' if overwrite else ''
     print(f'>> {total - len(todo_indices)}/{total} files already processed\n>> {len(input_paths)} to go.. {tag}\n')
-
     return input_paths, csv_paths, raw_paths
 
 def filter_todo_files(input_paths: List[str], csv_paths: List[str], raw_paths: List[str], keep_indices: List[int]) -> Tuple[List[str], List[str], List[str]]:
@@ -119,7 +92,7 @@ def filter_todo_files(input_paths: List[str], csv_paths: List[str], raw_paths: L
 
 def format_dataframe(data: pd.DataFrame, hdr: dict, ID: str) -> Tuple[pd.DataFrame, dict]:
     """
-    Formats the input dataframe by renaming columns and performing checks.
+    Formats the input dataframe by renaming columns and validating the breathing trace.
     
     Args:
     - data (pd.DataFrame): The input data.
@@ -128,36 +101,39 @@ def format_dataframe(data: pd.DataFrame, hdr: dict, ID: str) -> Tuple[pd.DataFra
 
     Returns:
     - Tuple[pd.DataFrame, dict]: The formatted dataframe and updated header.
+    
+    Raises:
+    - ValueError: If no valid/usable breathing trace can be found.
     """
 
-    # Ensure the breathing trace is present and valid
-    assert not np.all(data['breathing_trace'] == data.loc[0, 'breathing_trace']), 'No breathing trace was found'
+    # FIX: The data loader has already performed robust breathing trace selection.
+    # Instead of re-implementing the logic, we validate its output.
+    # This prevents flat signals from being passed to the core algorithm.
+    if 'breathing_trace' not in data.columns or np.nanstd(data['breathing_trace']) < 1e-6:
+        # Provide a clear error message indicating why the file cannot be processed.
+        raise ValueError(f"No usable breathing trace found for {ID}. All available channels (ptaf, cflow, abd, chest) might be flat or have insufficient signal.")
 
     # Rename specific columns for consistency
     old_names = ['resp', 'stage', 'arousal', 'abd', 'chest', 'spo2']
     new_names = ['Apnea', 'Stage', 'EEG_arousals', 'ABD', 'CHEST', 'SpO2']
 
     for old_name, new_name in zip(old_names, new_names):
-        try: 
-           data = data.rename(columns={old_name: new_name})
-        except:
-            data[new_name] = data[old_name]
-            data = data.drop(columns=old_name)
+        if old_name in data.columns:
+            data = data.rename(columns={old_name: new_name})
 
     # Add a combined ventilation column
     data['Ventilation_combined'] = data['breathing_trace']
     hdr['patient_ID'] = ID
 
-    # Ensure all required columns are present
-    check_cols = ['Apnea', 'ABD', 'airflow', 'CHEST', 'SpO2', 'Stage', 'EEG_arousals', 'breathing_trace', 'Ventilation_combined']
-    if 'Apnea' not in data.columns:
-        check_cols = check_cols[1:]
-
+    check_cols = ['ABD', 'CHEST', 'SpO2', 'Stage', 'EEG_arousals', 'breathing_trace', 'Ventilation_combined']
+    if 'Apnea' in data.columns:
+        check_cols.insert(0, 'Apnea')
+    
     for col in check_cols:
         assert col in data.columns, f'ERROR: {col} not in dataframe'
 
     return data, hdr
-
+    
 # save functions
 def save_raw_output(data: pd.DataFrame, hdr: dict, out_file: str) -> None:
     """
@@ -173,8 +149,10 @@ def save_raw_output(data: pd.DataFrame, hdr: dict, out_file: str) -> None:
 
     # Fill the DataFrame with relevant data columns
     df['breathing'] = data['breathing_trace']
-    df['ptaf'] = data['ptaf']
-    df['cflow'] = data['cflow']
+    if 'ptaf' in data.columns:
+        df['ptaf'] = data['ptaf']
+    if 'cflow' in data.columns:
+        df['cflow'] = data['cflow']
     df['abd'] = data['ABD']
     df['chest'] = data['CHEST']
     df['spo2'] = data['SpO2']
@@ -199,7 +177,7 @@ def save_raw_output(data: pd.DataFrame, hdr: dict, out_file: str) -> None:
     from Data_writers import write_to_hdf5_file
     write_to_hdf5_file(df, out_file, overwrite=True)
 
-def export_to_csv(pred: np.ndarray, csv_path: str, verbose: int = 0, Fs: int = 10, originalFs: int = 200) -> None:
+def export_to_csv(pred: np.ndarray, csv_path: str, verbose: int = 5, Fs: int = 10, originalFs: int = 200) -> None:
     """
     Exports the predicted respiration events to a CSV file, resampled to 1Hz.
 
@@ -234,7 +212,7 @@ def export_to_csv(pred: np.ndarray, csv_path: str, verbose: int = 0, Fs: int = 1
 
 # RUN ALGO
 @ray.remote
-def set_multiprocess_run(p: int, path: str, csv_out: str, raw_out: str, csv_folder: str, data_loader, total_num: int) -> bool:
+def set_multiprocess_run(p: int, path: str, csv_out: str, raw_out: str, csv_folder: str, data_loader, total_num: int, verbose: int=5) -> bool:
     """
     Function for running the algorithm in parallel using Ray.
     
@@ -252,7 +230,7 @@ def set_multiprocess_run(p: int, path: str, csv_out: str, raw_out: str, csv_fold
     """
 
     try:
-        success = set_individual_run(p, path, csv_out, raw_out, csv_folder, data_loader, total_num, verbose=0)
+        success = set_individual_run(p, path, csv_out, raw_out, csv_folder, data_loader, total_num, verbose=verbose)
         return success
     except Exception:
         return False
@@ -279,27 +257,24 @@ def set_individual_run(p: int, path: str, csv_out: str, raw_out: str, csv_folder
     patient_ID = path.split('/')[-1].split('.')[0]
     ratio = f'# {p + 1}/{total_num}'
     tag = patient_ID if len(patient_ID)<21 else patient_ID[:20]+'..'
-    print(f'({ratio}) Processing "{tag}"')
+    print(f'(# {p + 1}/{total_num}) Processing "{tag}"')
 
-    # Load data
     try:
+        # Load data (note: csv_folder used for side-loading other features like stage/arousal if needed)
         data, hdr = data_loader(path, csv_folder, add_CAISR=True, verbose=verbose)
         data, hdr = format_dataframe(data, hdr, patient_ID)
     except Exception as error:
-        if verbose > 1:
-            print(f'ERROR loading ({patient_ID}): {error}')
+        if verbose > 1: print(f'ERROR loading ({patient_ID}): {error}')
         return False
 
-    # Run the algorithm
     try:
         run_algorithm_pipeline(data, hdr, csv_out, raw_out, verbose=verbose)
     except Exception as error:
-        if verbose > 1:
-            print(f'ERROR rule-based algorithm ({patient_ID}): {error}')
+        if verbose > 1: print(f'ERROR algorithm ({patient_ID}): {error}')
         return False
 
     return True
-
+    
 def run_algorithm_pipeline(data: pd.DataFrame, hdr: dict, csv_out: str, raw_out: str, save_raw: bool = False, verbose: bool = True) -> None:
     """
     The main pipeline to run the algorithm on data, save results as CSV and HDF5.
@@ -318,6 +293,7 @@ def run_algorithm_pipeline(data: pd.DataFrame, hdr: dict, csv_out: str, raw_out:
     data = merge_connecting_saturation_drops(data, hdr)
 
     # Identify flow reductions and match potential hypopneas
+    # import pdb; pdb.set_trace()
     data = find_flow_reductions(data, hdr)
     data = match_saturation_and_ventilation_drops(data, hdr)
     data = match_EEG_with_ventilation_drops(data, hdr)
@@ -342,73 +318,59 @@ def run_algorithm_pipeline(data: pd.DataFrame, hdr: dict, csv_out: str, raw_out:
         os.makedirs(raw_folder, exist_ok=True)
         save_raw_output(data, hdr, raw_out)
 
-def CAISR_resp(in_paths: List[str], csv_folder: str, multiprocess: bool = True, overwrite: bool = False, verbose: int = 1) -> None:
-    """
-    Main function to run the CAISR respiratory event detection algorithm.
-    
-    Args:
-    - in_paths (List[str]): List of input file paths.
-    - csv_folder (str): Folder to save CSV outputs.
-    - multiprocess (bool): Whether to use multiprocessing.
-    - overwrite (bool): Whether to overwrite existing outputs.
-    - verbose (int): Verbosity level (0: silent, >0: detailed logs).
-    """
+def CAISR_resp(in_paths: List[str], csv_folder: str, raw_output_dir: str, multiprocess: bool = True, overwrite: bool = False, verbose: int = 5) -> None:
     timer('* Starting "caisr_resp" (created by Thijs Nassi, PhD)')
-
-    # Set dataloader and output folder
     data_loader = load_breathing_signals_from_prepared_data
-    raw_folder = './resp/raw_outputs/'
-
-    # Set output paths
-    in_paths, csv_paths, raw_paths = set_output_paths(in_paths, csv_folder, raw_folder, overwrite)
+    
+    in_paths, csv_paths, raw_paths = set_output_paths(in_paths, csv_folder, raw_output_dir, overwrite)
     finished = [False] * len(in_paths)
     total = len(in_paths)
-
-    # Run Multiprocessing
+    
     if multiprocess:
         try:
-            if verbose > 0:
-                print(f'Parallel processing {total} files..')
-            ray.init(num_cpus=4, logging_level=logging.CRITICAL)
-            futures = [set_multiprocess_run.remote(p, pi, pc, pr, csv_folder, data_loader, total)
+            if verbose > 0: print(f'Parallel processing {total} files..')
+            # Initialize Ray (adjust num_cpus as needed)
+            ray.init(num_cpus=min(20, os.cpu_count()), logging_level=logging.CRITICAL)
+            
+            futures = [set_multiprocess_run.remote(p, pi, pc, pr, csv_folder, data_loader, total, verbose)
                        for p, (pi, pc, pr) in enumerate(zip(in_paths, csv_paths, raw_paths))]
+            
             finished = ray.get(futures)
             ray.shutdown()
-            if verbose > 0:
-                print(f'  Successful for {sum(finished)}/{total} recordings\n')
+            
+            if verbose > 0: print(f'  Successful for {sum(finished)}/{total} recordings\n')
         except Exception as e:
-            if verbose > 0:
-                print(f'Parallel processing setup failed/interrupted: {e}')
+            if verbose > 0: print(f'Parallel processing failed or interrupted: {e}')
+            if ray.is_initialized(): ray.shutdown()
 
-    # Run sequential processing for files not done by multiprocessing
-    todo = np.array([not f for f in finished])
-    if sum(todo) > 0:
-        in_paths, csv_paths, raw_paths = filter_todo_files(in_paths, csv_paths, raw_paths, todo)
-        if verbose > 1:
-            print(f'Processing {sum(todo)} recording(s) in loop.')
+    # Retry failed or process sequentially if MP disabled
+    todo_indices = np.where([not f for f in finished])[0]
+    if len(todo_indices) > 0:
+        print("Processing remaining files sequentially...")
+        for idx in todo_indices:
+            finished[idx] = set_individual_run(idx, in_paths[idx], csv_paths[idx], raw_paths[idx], csv_folder, data_loader, total, verbose)
 
-        for p, (pi, pc, pr) in enumerate(zip(in_paths, csv_paths, raw_paths)):
-            loc = np.where(todo)[0][p]
-            finished[loc] = set_individual_run(p, pi, pc, pr, csv_folder, data_loader, total, verbose)
-
-    # Final summary
     print(f'{sum(finished)}/{total} recordings were successfully processed.')
     timer('* Finishing "caisr_resp"')
 
-
 if __name__ == "__main__":
-    # Set up argument parsing
     parser = argparse.ArgumentParser(description="Run CAISR respiratory event detection.")
-    parser.add_argument("--data_folder", type=str, default='./data/', help="Folder containing the prepared .h5 data files.")
-    parser.add_argument("--csv_folder", type=str, default='./caisr_output/intermediate/', help="Folder where CAISR's output CSV files will be stored.")
-
-    # Parse the arguments
+    parser.add_argument("--input_data_dir", type=str, required=True, help="Folder containing the prepared .h5 data files.")
+    parser.add_argument("--output_csv_dir", type=str, required=True, help="Folder where CAISR's output CSV files will be stored.")
+    parser.add_argument("--param_dir", type=str, required=True, help="Folder containing the run parameters file.")
     args = parser.parse_args()
-
-    # Extract run parameters
-    multiprocess, overwrite = extract_run_parameters(args.data_folder + 'run_parameters/resp.csv')
-
-    # Run CAISR resp
-    input_files = glob.glob(args.data_folder + '*.h5')
-    CAISR_resp(input_files, args.csv_folder, multiprocess=multiprocess, overwrite=overwrite, verbose=0)
-
+        
+    input_files = glob.glob(os.path.join(args.input_data_dir, '*.h5'))
+    param_file = os.path.join(args.param_dir, 'resp.csv')
+    
+    if not os.path.exists(param_file):
+        os.makedirs(args.param_dir, exist_ok=True)
+        pd.DataFrame({'overwrite': [False], 'multiprocess': [True]}).to_csv(param_file, index=False)
+        
+    multiprocess, overwrite = extract_run_parameters(param_file)
+    
+    # Define raw output dir based on CSV output dir
+    raw_out = os.path.join(args.output_csv_dir, 'resp', 'raw_outputs')
+    
+    CAISR_resp(input_files, args.output_csv_dir, raw_out, multiprocess=multiprocess, overwrite=overwrite, verbose=5)
+    

@@ -1,3 +1,5 @@
+# utils_docker.py
+
 import sys
 # sys.path.insert(1, '../../prepared_data')
 # from load_data import get_cohort_channels
@@ -18,29 +20,70 @@ if not sys.warnoptions:
 from collections import Counter
 from sklearn.preprocessing import RobustScaler
 
+# BITS layout: a single 2D top-level `Xy` dataset (n_channels, n_samples).
+# Row order fixed by dataset convention — used to unpack into named columns.
+BITS_XY_COLS = [
+    'f3-m2', 'f4-m1', 'c3-m2', 'c4-m1', 'o1-m2', 'o2-m1',
+    'e1-m2', 'e2-m1', 'chin1-chin2',
+    'abd', 'chest', 'airflow', 'ptaf', 'cflow', 'spo2', 'ecg',
+    'lat', 'rat', 'cpres', 'cpap_on',
+    'stage_majority', 'arousal_majority', 'resp_majority', 'limb_majority',
+    'stage_0', 'arousal_0', 'resp_0', 'limb_0',
+    'stage_1', 'arousal_1', 'resp_1', 'limb_1',
+    'stage_2', 'arousal_2', 'resp_2', 'limb_2',
+]
+
+
 def load_prepared_data(file_path:str, get_signals:list=[]):
-    """ 
-    load prepared data format (post March 22, 2023). Currently, all signals are read. 
+    """
+    load prepared data format (post March 22, 2023). Currently, all signals are read.
     Inputs:
     file_path: path to prepared .h5 file.
     """
     # init DF
     Xy = pd.DataFrame([])
-    
+
     # read file
     with h5py.File(file_path, 'r') as f:
+        # BITS layout: single 2D `Xy` dataset with rows matching BITS_XY_COLS.
+        top = list(f.keys())
+        if len(top) == 1 and top[0] == 'Xy' and isinstance(f['Xy'], h5py.Dataset) and f['Xy'].ndim == 2:
+            arr = f['Xy'][:]
+            if arr.shape[0] != len(BITS_XY_COLS):
+                raise ValueError(
+                    f"BITS Xy has {arr.shape[0]} rows; expected {len(BITS_XY_COLS)} "
+                    f"matching BITS_XY_COLS."
+                )
+            wanted = BITS_XY_COLS if len(get_signals) == 0 else [c for c in BITS_XY_COLS if c in get_signals]
+            for i, name in enumerate(BITS_XY_COLS):
+                if name in wanted:
+                    Xy[name] = arr[i, :]
+            params = {}
+            for attrs in f.attrs.keys():
+                params[attrs] = f.attrs[attrs]
+            return Xy, params
+
         # Loop over each group and dataset within each group and get data
-        group_names = list(f.keys())
-        for group_name in group_names:        
-            group = f[group_name]
-            # list all existing datasets
-            dataset_names = list(group.keys())
-            # get all, or take from get_signals
-            get_names = dataset_names if len(get_signals)==0 else [c for c in dataset_names if c in get_signals]
-            for dataset_name in get_names:
-                dataset = group[dataset_name][:]
-                assert dataset.shape[1] == 1, "Only one-dimensional datasets expected"
-                Xy[dataset_name] = dataset.flatten()
+        group_names = top
+        for group_name in group_names:
+            item = f[group_name]
+            if isinstance(item, h5py.Dataset):
+                # flat structure — top-level items are datasets directly
+                if len(get_signals) == 0 or group_name in get_signals:
+                    dataset = item[:]
+                    if dataset.ndim == 2:
+                        assert dataset.shape[1] == 1, "Only one-dimensional datasets expected"
+                    Xy[group_name] = dataset.flatten()
+            else:
+                # nested group/dataset structure
+                group = item
+                dataset_names = list(group.keys())
+                get_names = dataset_names if len(get_signals)==0 else [c for c in dataset_names if c in get_signals]
+                for dataset_name in get_names:
+                    dataset = group[dataset_name][:]
+                    if dataset.ndim == 2:
+                        assert dataset.shape[1] == 1, "Only one-dimensional datasets expected"
+                    Xy[dataset_name] = dataset.flatten()
         
         # save attributes
         params = {}
@@ -234,30 +277,80 @@ def select_signals_cohort(path):
     original_Fs = 200
     new_Fs = 100
     Fs = 100
-    # 
     period_length_sec = 0.5 # sec
     
     data, params = load_prepared_data(path)
     data = data.astype(np.float64)
-    channels = data.columns.tolist()
-    common_sigs = ['e1-m2', 'chin1-chin2', 'abd', 'chest', 'ecg']
-    eeg = ['c3-m2', 'c4-m1']
     # import pdb; pdb.set_trace()
-    select_channels = eeg + common_sigs
-    signals = data[select_channels]
+    # --- START OF MODIFICATION ---
+
+    # Define the complete list of channels the model expects
+    eeg = ['c3-m2', 'c4-m1']
+    common_sigs = ['e1-m2', 'chin1-chin2', 'abd', 'chest', 'ecg']
+    expected_channels = eeg + common_sigs
+    
+    # Get the channels that are actually available in the file
+    available_channels = data.columns.tolist()
+    
+    # Identify which of the expected channels are present and which are missing
+    channels_found = [ch for ch in expected_channels if ch in available_channels]
+    channels_missing = [ch for ch in expected_channels if ch not in available_channels]
+    
+    # Contralateral substitution map for EEG and EOG channels
+    contralateral = {
+        'c3-m2': 'c4-m1',
+        'c4-m1': 'c3-m2',
+        'e1-m2': 'e2-m1',
+        'e2-m1': 'e1-m2',
+    }
+
+    # If any channels are missing, attempt contralateral substitution before falling back to zeros
+    if channels_missing:
+        the_id = path.split('/')[-1].split('.')[0]
+        zeros_fallback = []
+        substituted = []
+        for missing_ch in channels_missing:
+            contra = contralateral.get(missing_ch)
+            if contra and contra in available_channels:
+                substituted.append(f'{missing_ch} -> {contra}')
+            else:
+                zeros_fallback.append(missing_ch)
+        if substituted:
+            print(f'   [WARNING] File "{the_id}" is missing channels, using contralateral substitution: {substituted}.')
+        if zeros_fallback:
+            print(f'   [WARNING] File "{the_id}" is missing channels with no substitute available, replacing with zeros: {zeros_fallback}.')
+
+    # Select only the available signals from the data
+    signals = data[channels_found]
+
+    # Fill missing channels: contralateral if available, otherwise zeros
+    for missing_ch in channels_missing:
+        contra = contralateral.get(missing_ch)
+        if contra and contra in available_channels:
+            signals[missing_ch] = data[contra].values
+        else:
+            signals[missing_ch] = 0.0
+        
+    # Reorder the columns to match the expected order for the model
+    signals = signals[expected_channels]
+    
+    # --- END OF MODIFICATION ---
+    
     signals = do_initial_preprocessing(signals, new_Fs, original_Fs)
     length_to_match_30 = int(signals.shape[0]/(Fs * period_length_sec))
     length_to_match_30 = int(length_to_match_30 * Fs * period_length_sec)
     signals = signals.iloc[0:length_to_match_30,:]
     
-    sigs = signals[eeg + common_sigs].values.T 
+    # NOTE: The original code had a potential typo here `eeg + common_sigs` which used the original lists.
+    # It should use `expected_channels` to ensure the order is correct.
+    sigs = signals[expected_channels].values.T 
     sigs, chan_inds = clip_noisy_values(sigs.T, new_Fs, period_length_sec)
     transformer = RobustScaler().fit(sigs) 
    
     sigs = transformer.transform(sigs)
     sigs = sigs.T
     
-    channles_selected = eeg + common_sigs
+    channles_selected = expected_channels
     return sigs, new_Fs, channles_selected, len(data)
 
 
