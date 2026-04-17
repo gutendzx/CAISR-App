@@ -30,6 +30,7 @@ import argparse
 import multiprocessing
 import tempfile
 import shutil
+from math import gcd
 
 import h5py as h5
 import mne
@@ -39,8 +40,40 @@ from glob import glob
 from typing import List, Tuple
 
 from scipy.stats import iqr
-from scipy.signal import resample
+from scipy.signal import resample, resample_poly
 from sklearn.preprocessing import RobustScaler
+
+# EDF loader (only required when an .edf input is encountered).
+try:
+    from edf_loader import load_edf_for_caisr as _load_edf_for_caisr
+except ImportError:
+    _load_edf_for_caisr = None
+
+
+def _load_arousal_edf_as_sig_group(file: str, target_fs: int = 200) -> dict:
+    """Read an .edf file and return a {channel_name: 1D ndarray} dict at *target_fs*.
+
+    Drop-in for the dict produced by the H5 loader paths in
+    ``pre_process_temporal_scaling`` — same shape, same units (Volts).
+    Each EDF channel is independently resampled to *target_fs* via polyphase
+    filtering. Channel renaming / bipolar derivations are handled by
+    ``edf_loader.load_edf_for_caisr`` using ``channel_table.csv``.
+    """
+    if _load_edf_for_caisr is None:
+        raise ImportError(
+            "EDF input detected but `edfio` is not installed. "
+            "Run `pip install edfio` inside the caisr_arousal environment."
+        )
+    channel_data, channel_fs = _load_edf_for_caisr(file)
+    sig_group: dict = {}
+    for ch, sig in channel_data.items():
+        sig = np.asarray(sig, dtype=np.float64)
+        src_fs = float(channel_fs[ch])
+        if src_fs != float(target_fs):
+            g = gcd(int(target_fs), int(src_fs))
+            sig = resample_poly(sig, int(target_fs) // g, int(src_fs) // g)
+        sig_group[ch] = sig
+    return sig_group
 
 # Suppress noisy framework logs before any TF/MNE imports
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -601,67 +634,73 @@ def pre_process_temporal_scaling(
         'stage_2', 'arousal_2', 'resp_2', 'limb_2',
     ]
 
-    # --- Load raw signals ---
-    with h5.File(file, "r") as f:
-        # Support BITS (single 2D `Xy`), nested (f["signals"]/channel), and flat (f/channel) layouts.
-        _top = list(f.keys())
-        if len(_top) == 1 and _top[0] == 'Xy' and isinstance(f['Xy'], h5.Dataset) and f['Xy'].ndim == 2:
-            _xy = f['Xy'][:]
-            if _xy.shape[0] != len(_BITS_XY_COLS):
-                raise ValueError(
-                    f"BITS Xy has {_xy.shape[0]} rows; expected {len(_BITS_XY_COLS)} "
-                    f"matching _BITS_XY_COLS."
-                )
-            sig_group = {name: _xy[i, :] for i, name in enumerate(_BITS_XY_COLS)}
-        else:
-            sig_group = f["signals"] if "signals" in f else f
-        available = set(sig_group.keys())
-        missing_idx = [i for i, ch in enumerate(channels) if ch not in available]
-        substitute_map: dict = {}  # missing ch -> available substitute ch
-        if missing_idx:
-            # Try non-EEG fallbacks first
-            non_eeg_missing = []
-            for i in missing_idx:
-                if channel_type[i] == "EEG":
-                    continue
-                ch = channels[i]
-                sub = next((s for s in _NON_EEG_FALLBACK.get(ch, []) if s in available), None)
-                if sub:
-                    substitute_map[ch] = sub
-                else:
-                    non_eeg_missing.append(ch)
-            if non_eeg_missing:
-                raise ValueError(
-                    f"Required non-EEG channel(s) missing: {non_eeg_missing}. "
-                    f"Available: {sorted(available)}"
-                )
-            eeg_missing = [channels[i] for i in missing_idx if channel_type[i] == "EEG"]
-            substituted, no_substitute = [], []
-            for ch in eeg_missing:
-                sub = next((s for s in _EEG_FALLBACK.get(ch, []) if s in available), None)
-                if sub:
-                    substitute_map[ch] = sub
-                    substituted.append(f"{ch} -> {sub}")
-                else:
-                    no_substitute.append(ch)
-            if substitute_map:
-                warnings.warn(f"Channel(s) missing, using substitute: {list(substitute_map.items())}.")
-            if no_substitute:
-                warnings.warn(f"EEG channel(s) {no_substitute} not in file and no substitute — skipping.")
-            keep_idx = [i for i, ch in enumerate(channels)
-                        if ch in available or ch in substitute_map]
-            channels = [channels[i] for i in keep_idx]
-            channel_type = [channel_type[i] for i in keep_idx]
-        if not any(ct == "EEG" for ct in channel_type):
+    # --- Load raw signals (H5 or EDF, auto-detected) ---
+    if file.lower().endswith('.edf'):
+        sig_group = _load_arousal_edf_as_sig_group(file, target_fs=200)
+    else:
+        with h5.File(file, "r") as f:
+            # Support BITS (single 2D `Xy`), nested (f["signals"]/channel), and flat (f/channel) layouts.
+            _top = list(f.keys())
+            if len(_top) == 1 and _top[0] == 'Xy' and isinstance(f['Xy'], h5.Dataset) and f['Xy'].ndim == 2:
+                _xy = f['Xy'][:]
+                if _xy.shape[0] != len(_BITS_XY_COLS):
+                    raise ValueError(
+                        f"BITS Xy has {_xy.shape[0]} rows; expected {len(_BITS_XY_COLS)} "
+                        f"matching _BITS_XY_COLS."
+                    )
+                sig_group = {name: _xy[i, :] for i, name in enumerate(_BITS_XY_COLS)}
+            else:
+                # Materialise to a dict so the h5 file handle can close cleanly.
+                _src = f["signals"] if "signals" in f else f
+                sig_group = {k: np.array(_src[k]) for k in _src.keys()}
+
+    available = set(sig_group.keys())
+    missing_idx = [i for i, ch in enumerate(channels) if ch not in available]
+    substitute_map: dict = {}  # missing ch -> available substitute ch
+    if missing_idx:
+        # Try non-EEG fallbacks first
+        non_eeg_missing = []
+        for i in missing_idx:
+            if channel_type[i] == "EEG":
+                continue
+            ch = channels[i]
+            sub = next((s for s in _NON_EEG_FALLBACK.get(ch, []) if s in available), None)
+            if sub:
+                substitute_map[ch] = sub
+            else:
+                non_eeg_missing.append(ch)
+        if non_eeg_missing:
             raise ValueError(
-                f"No EEG channels available. Available signals: {sorted(available)}"
+                f"Required non-EEG channel(s) missing: {non_eeg_missing}. "
+                f"Available: {sorted(available)}"
             )
-        _first_src = substitute_map.get(channels[0], channels[0])
-        n_samples = len(sig_group[_first_src])
-        data = np.zeros((len(channels), n_samples))
-        for i, ch in enumerate(channels):
-            src = substitute_map.get(ch, ch)
-            data[i, :] = np.squeeze(np.array(sig_group[src]))
+        eeg_missing = [channels[i] for i in missing_idx if channel_type[i] == "EEG"]
+        substituted, no_substitute = [], []
+        for ch in eeg_missing:
+            sub = next((s for s in _EEG_FALLBACK.get(ch, []) if s in available), None)
+            if sub:
+                substitute_map[ch] = sub
+                substituted.append(f"{ch} -> {sub}")
+            else:
+                no_substitute.append(ch)
+        if substitute_map:
+            warnings.warn(f"Channel(s) missing, using substitute: {list(substitute_map.items())}.")
+        if no_substitute:
+            warnings.warn(f"EEG channel(s) {no_substitute} not in file and no substitute — skipping.")
+        keep_idx = [i for i, ch in enumerate(channels)
+                    if ch in available or ch in substitute_map]
+        channels = [channels[i] for i in keep_idx]
+        channel_type = [channel_type[i] for i in keep_idx]
+    if not any(ct == "EEG" for ct in channel_type):
+        raise ValueError(
+            f"No EEG channels available. Available signals: {sorted(available)}"
+        )
+    _first_src = substitute_map.get(channels[0], channels[0])
+    n_samples = len(sig_group[_first_src])
+    data = np.zeros((len(channels), n_samples))
+    for i, ch in enumerate(channels):
+        src = substitute_map.get(ch, ch)
+        data[i, :] = np.squeeze(np.array(sig_group[src]))
 
     # --- Detect pre-normalised (qli) vs raw (EDF/HSP) data ---
     # JMLR qli-prepared H5 files are clipped and RobustScaler-normalised to
@@ -1045,7 +1084,10 @@ if __name__ == "__main__":
 
         timer('Starting CAISR arousal detection')
 
-        input_files = glob(os.path.join(args.input_data_dir, "*.h5"))
+        input_files = sorted(
+            glob(os.path.join(args.input_data_dir, "*.h5")) +
+            glob(os.path.join(args.input_data_dir, "*.edf"))
+        )
         overwrite, multiprocess = extract_run_parameters(
             os.path.join(args.param_dir, "arousal.csv")
         )

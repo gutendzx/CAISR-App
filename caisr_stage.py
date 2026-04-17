@@ -4,11 +4,14 @@ Author: Samaneh Nasiri, PhD
 Cleaned/Refactored for Public Repository
 
 Description:
-    Runs the sleep staging model (GraphSleepNet/ProductGraphSleepNet) on .h5 input files.
+    Runs the sleep staging model (GraphSleepNet/ProductGraphSleepNet) on PSG
+    input files.
     Supports both sequential and multiprocessing execution.
+    Accepts either pre-processed .h5 files (legacy CAISR format) or raw .edf
+    recordings; format is auto-detected per file by extension.
 
 Requirements:
-    - Input data must be in .h5 format.
+    - Input data must be .h5 and/or .edf in the input directory.
     - Parameter file (stage.csv) must exist.
     - Pre-trained model weights must be available in `model_dir`.
 """
@@ -21,11 +24,14 @@ import warnings
 import argparse
 import logging
 import multiprocessing
+from math import gcd
 import numpy as np
 import pandas as pd
 import h5py
 import tensorflow as tf
 from tensorflow import keras
+from scipy.signal import resample_poly
+from sklearn.preprocessing import RobustScaler
 
 # Suppress TF warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -43,10 +49,90 @@ try:
     from utils_docker import *
     from ProductGraphSleepNet import *
     from utils_model import *
+    # Keep an explicit handle on the H5 loader so the unified dispatcher below
+    # can fall back to it when the input is a .h5 file.
+    from utils_docker import select_signals_cohort as _select_signals_cohort_h5
 except ImportError as e:
     print(f"Error importing local modules: {e}")
     print("Ensure 'stage' and 'stage/graphsleepnet' directories exist and contain required scripts.")
     sys.exit(1)
+
+# EDF loader (only required when an .edf input is encountered).
+try:
+    from edf_loader_pyedflib import load_edf_for_caisr as _load_edf_for_caisr
+except ImportError:
+    _load_edf_for_caisr = None
+
+
+def _select_signals_cohort_edf(path: str):
+    """EDF counterpart of utils_docker.select_signals_cohort for caisr_stage.
+
+    Returns the same ``(sigs, new_Fs, channels, length_at_200Hz)`` tuple as
+    the H5 loader, so ``process_single_file`` is format-agnostic.
+    """
+    if _load_edf_for_caisr is None:
+        raise ImportError(
+            "EDF input detected but `pyedflib` is not installed. "
+            "Run `pip install pyedflib` inside the caisr_stage environment."
+        )
+    new_Fs = 100
+    Fs = 100
+    period_length_sec = 0.5
+    fs_output_ref = 200
+
+    channel_data, channel_fs = _load_edf_for_caisr(path)
+
+    eeg = ['c3-m2', 'c4-m1']
+    common_sigs = ['e1-m2', 'chin1-chin2', 'abd', 'chest', 'ecg']
+    expected_channels = eeg + common_sigs
+
+    available_channels = set(channel_data.keys())
+    channels_found = [ch for ch in expected_channels if ch in available_channels]
+    channels_missing = [ch for ch in expected_channels if ch not in available_channels]
+
+    if channels_missing:
+        the_id = os.path.splitext(os.path.basename(path))[0]
+        raise ValueError(
+            f"SKIP '{the_id}': missing required channels: {channels_missing}"
+        )
+    if not channels_found:
+        raise ValueError(f"No recognisable channels found in {path}.")
+
+    resampled = {}
+    for ch in channels_found:
+        sig = channel_data[ch].astype(np.float64)
+        src_fs = float(channel_fs[ch])
+        if src_fs != float(new_Fs):
+            g = gcd(int(new_Fs), int(src_fs))
+            sig = resample_poly(sig, int(new_Fs) // g, int(src_fs) // g)
+        resampled[ch] = sig
+
+    n_samples = min(len(v) for v in resampled.values())
+    duration_sec = n_samples / new_Fs
+    length_data = int(duration_sec * fs_output_ref)
+
+    signal_matrix = {
+        ch: (resampled[ch][:n_samples] if ch in resampled else np.zeros(n_samples))
+        for ch in expected_channels
+    }
+    signals = pd.DataFrame(signal_matrix)[expected_channels]
+
+    step = int(Fs * period_length_sec)
+    n_steps = len(signals) // step
+    signals = signals.iloc[: n_steps * step, :]
+
+    sigs = signals[expected_channels].values
+    sigs, _chan_inds = clip_noisy_values(sigs, new_Fs, period_length_sec)
+    sigs = RobustScaler().fit_transform(sigs).T
+
+    return sigs, new_Fs, expected_channels, length_data
+
+
+def select_signals_cohort(path: str):
+    """Unified dispatcher: load + pre-process from either .h5 or .edf."""
+    if path.lower().endswith('.edf'):
+        return _select_signals_cohort_edf(path)
+    return _select_signals_cohort_h5(path)
 
 
 def timer(tag: str) -> None:
@@ -260,7 +346,10 @@ if __name__ == "__main__":
     else:
         print(">> TensorFlow is CPU only.")
 
-    input_files = glob.glob(os.path.join(args.input_data_dir, '*.h5'))
+    input_files = sorted(
+        glob.glob(os.path.join(args.input_data_dir, '*.h5')) +
+        glob.glob(os.path.join(args.input_data_dir, '*.edf'))
+    )
     
     # Load parameters
     param_file = os.path.join(args.param_dir, 'stage.csv')

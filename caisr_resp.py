@@ -5,6 +5,8 @@ Cleaned/Refactored for Public Repository
 
 Description:
     Runs rule-based respiratory event detection (Apnea, Hypopnea, RERA).
+    Accepts either pre-processed .h5 files (legacy CAISR format) or raw .edf
+    recordings; format is auto-detected per file by extension.
     Uses Ray for parallel processing.
 """
 
@@ -14,9 +16,11 @@ import time
 import logging
 import argparse
 import glob
+from math import gcd
 import numpy as np
 import pandas as pd
 from typing import List, Tuple
+from scipy.signal import resample_poly
 
 # --- Local Imports ---
 # Ensure 'resp' folder exists
@@ -28,6 +32,177 @@ from resp.rule_based_functions.Resp_event_hierarchy import *
 from resp.rule_based_functions.Post_processing import *
 from resp.utils_functions.Data_loaders import *
 from resp.utils_functions.Data_writers import *
+
+# EDF loader (only required when an .edf input is encountered).
+try:
+    from edf_loader_pyedflib import load_edf_for_caisr as _load_edf_for_caisr
+except ImportError:
+    _load_edf_for_caisr = None
+
+
+def _load_breathing_signals_from_edf(
+    path: str,
+    csv_folder: str,
+    add_CAISR: bool = True,
+    verbose: int = 5,
+    original_fs: int = 200,
+    new_fs: int = 10,
+) -> Tuple[pd.DataFrame, dict]:
+    """EDF counterpart of load_breathing_signals_from_prepared_data.
+
+    Drop-in replacement: same signature, same return tuple ``(signals_df, hdr)``.
+    Loads the EDF, resamples each channel individually to ``original_fs``
+    (200 Hz), then runs the identical post-load pipeline as the H5 loader.
+    """
+    if _load_edf_for_caisr is None:
+        raise ImportError(
+            "EDF input detected but `pyedflib` is not installed. "
+            "Run `pip install pyedflib` inside the caisr_resp environment."
+        )
+    the_id = os.path.splitext(os.path.basename(path))[0]
+    channel_data, channel_fs = _load_edf_for_caisr(path)
+    if not channel_data:
+        raise ValueError(f'No channels could be loaded from {path}.')
+
+    resampled = {}
+    for ch, sig in channel_data.items():
+        sig = np.asarray(sig, dtype=np.float64)
+        src_fs = float(channel_fs[ch])
+        if src_fs > float(original_fs):
+            g = gcd(int(original_fs), int(src_fs))
+            sig = resample_poly(sig, int(original_fs) // g, int(src_fs) // g)
+        elif src_fs < float(original_fs):
+            sig = np.repeat(sig, int(round(original_fs / src_fs)))
+        resampled[ch] = sig
+
+    n_samples = min(len(v) for v in resampled.values())
+    resampled = {ch: v[:n_samples] for ch, v in resampled.items()}
+
+    REQUIRED = ['abd', 'chest', 'spo2']
+    missing = [ch for ch in REQUIRED if ch not in resampled]
+    if missing:
+        raise ValueError(
+            f'"{the_id}" is missing required channel(s) {missing}. '
+            f'Subject will be skipped.'
+        )
+
+    WANTED = ['ptaf', 'cflow', 'abd', 'chest', 'airflow', 'spo2', 'ecg']
+    signals_df = pd.DataFrame(index=range(n_samples))
+    for ch in WANTED:
+        if ch in resampled:
+            signals_df[ch] = resampled[ch]
+
+    if add_CAISR:
+        stage_csv = os.path.join(csv_folder, 'stage', f'{the_id}_stage.csv')
+        if os.path.exists(stage_csv):
+            try:
+                stage_vals = pd.read_csv(stage_csv)['stage'].fillna(5).values
+                stage_up = np.repeat(stage_vals, original_fs)
+                if len(stage_up) >= n_samples:
+                    signals_df['stage'] = stage_up[:n_samples]
+                else:
+                    signals_df['stage'] = np.pad(
+                        stage_up, (0, n_samples - len(stage_up)), constant_values=5
+                    )
+            except Exception as exc:
+                if verbose > 0:
+                    print(f'   [WARNING] Could not load stage CSV for "{the_id}": {exc}')
+        elif verbose > 0:
+            print(f'   [WARNING] Stage CSV not found for "{the_id}" (expected: {stage_csv})')
+
+        arousal_csv = os.path.join(csv_folder, 'arousal', f'{the_id}_arousal.csv')
+        if os.path.exists(arousal_csv):
+            try:
+                ar_df = pd.read_csv(arousal_csv)
+                arousal_arr = np.zeros(n_samples, dtype=np.float32)
+                for _, row in ar_df.iterrows():
+                    scale = original_fs / 200.0
+                    s = int(row['start_idx'] * scale)
+                    e = min(int(row['end_idx'] * scale), n_samples)
+                    if s < n_samples and not np.isnan(row.get('arousal', np.nan)):
+                        arousal_arr[s:e] = float(row['arousal'])
+                signals_df['arousal'] = arousal_arr
+            except Exception as exc:
+                if verbose > 0:
+                    print(f'   [WARNING] Could not load arousal CSV for "{the_id}": {exc}')
+        elif verbose > 0:
+            print(f'   [WARNING] Arousal CSV not found for "{the_id}" (expected: {arousal_csv})')
+    else:
+        signals_df['stage'] = signals_df.get('stage', 0)
+        signals_df['arousal'] = signals_df.get('arousal', 0)
+
+    signals_df = do_initial_preprocessing(signals_df, new_fs, original_fs)
+
+    bad_channels = []
+    for channel in ['ptaf', 'cflow']:
+        if channel in signals_df.columns and signals_df[channel].std() < 1e-4:
+            if verbose:
+                print(f'   [{the_id}] Channel "{channel}" is flat — ignored.')
+            bad_channels.append(channel)
+    if bad_channels:
+        signals_df = signals_df.drop(columns=bad_channels)
+
+    br_trace, split_loc = morphology_select_breathing_trace(signals_df, new_fs, verbose)
+    tag = 'signal morphology'
+
+    if 'cpap_on' in signals_df.columns:
+        br_trace_cpap, split_loc_cpap = cpapOn_select_breathing_trace(signals_df)
+        if br_trace_cpap:
+            br_trace, split_loc = br_trace_cpap, split_loc_cpap
+            tag = 'cpap_on'
+        signals_df = signals_df.drop(columns=['cpap_on'])
+    elif verbose == 2:
+        print(f'   [{the_id}] No "cpap_on" channel found.')
+
+    if isinstance(split_loc, (int, float)):
+        split_loc = int(split_loc * new_fs / original_fs)
+
+    signals_df = clip_normalize_signals(signals_df, new_fs, br_trace, split_loc)
+
+    if split_loc is None:
+        if br_trace and br_trace[0] in signals_df.columns:
+            signals_df['breathing_trace'] = signals_df[br_trace[0]].values
+        else:
+            br_trace = []
+        if not br_trace or signals_df[br_trace[0]].std() < 1e-4:
+            if verbose:
+                print(f'   [{the_id}] No valid flow trace — using "abd+chest" fallback.')
+            abd = signals_df['abd'].rolling(int(0.5 * new_fs), center=True, min_periods=1).median().fillna(0)
+            chest = signals_df['chest'].rolling(int(0.5 * new_fs), center=True, min_periods=1).median().fillna(0)
+            signals_df['breathing_trace'] = abd + chest
+            br_trace = ['abd+chest']
+    else:
+        signals_df['breathing_trace'] = np.nan
+        signals_df.loc[:split_loc, 'breathing_trace'] = signals_df.loc[:split_loc, br_trace[0]]
+        signals_df.loc[split_loc:, 'breathing_trace'] = signals_df.loc[split_loc:, br_trace[1]]
+
+    if 'airflow' not in signals_df.columns or signals_df['airflow'].std() < 1e-4:
+        signals_df['airflow'] = signals_df['breathing_trace']
+
+    hdr = setup_header(path, new_fs, original_fs, br_trace, split_loc)
+    if verbose == 2:
+        print(f'   [{the_id}] Study: {hdr["test_type"]} (based on "{tag}").')
+
+    signals_df['patient_asleep'] = np.logical_and(
+        signals_df['stage'] > 0, signals_df['stage'] < 5
+    )
+    return signals_df, hdr
+
+
+def load_breathing_signals_dispatch(
+    path: str,
+    csv_folder: str,
+    add_CAISR: bool = True,
+    verbose: int = 5,
+) -> Tuple[pd.DataFrame, dict]:
+    """Unified data_loader: dispatches on extension between H5 and EDF loaders."""
+    if path.lower().endswith('.edf'):
+        return _load_breathing_signals_from_edf(
+            path, csv_folder, add_CAISR=add_CAISR, verbose=verbose
+        )
+    return load_breathing_signals_from_prepared_data(
+        path, csv_folder, add_CAISR=add_CAISR, verbose=verbose
+    )
 
 def timer(tag: str) -> None:
     print(tag)
@@ -320,7 +495,7 @@ def run_algorithm_pipeline(data: pd.DataFrame, hdr: dict, csv_out: str, raw_out:
 
 def CAISR_resp(in_paths: List[str], csv_folder: str, raw_output_dir: str, multiprocess: bool = True, overwrite: bool = False, verbose: int = 5) -> None:
     timer('* Starting "caisr_resp" (created by Thijs Nassi, PhD)')
-    data_loader = load_breathing_signals_from_prepared_data
+    data_loader = load_breathing_signals_dispatch
     
     in_paths, csv_paths, raw_paths = set_output_paths(in_paths, csv_folder, raw_output_dir, overwrite)
     finished = [False] * len(in_paths)
@@ -355,12 +530,15 @@ def CAISR_resp(in_paths: List[str], csv_folder: str, raw_output_dir: str, multip
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run CAISR respiratory event detection.")
-    parser.add_argument("--input_data_dir", type=str, required=True, help="Folder containing the prepared .h5 data files.")
+    parser.add_argument("--input_data_dir", type=str, required=True, help="Folder containing prepared .h5 and/or raw .edf data files.")
     parser.add_argument("--output_csv_dir", type=str, required=True, help="Folder where CAISR's output CSV files will be stored.")
     parser.add_argument("--param_dir", type=str, required=True, help="Folder containing the run parameters file.")
     args = parser.parse_args()
         
-    input_files = glob.glob(os.path.join(args.input_data_dir, '*.h5'))
+    input_files = sorted(
+        glob.glob(os.path.join(args.input_data_dir, '*.h5')) +
+        glob.glob(os.path.join(args.input_data_dir, '*.edf'))
+    )
     param_file = os.path.join(args.param_dir, 'resp.csv')
     
     if not os.path.exists(param_file):

@@ -46,3 +46,7 @@ tqdm==4.66.4
 tzdata==2024.1
 urllib3==2.2.2
 zipp==3.19.2
+
+# EDF input support — required when caisr_resp.py is fed .edf files
+# (caisr_resp uses the pyedflib backend in edf_loader_pyedflib.py)
+pyEDFlib>=0.1.30

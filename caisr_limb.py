@@ -5,6 +5,10 @@ Cleaned/Refactored for Public Repository
 
 Description:
     Runs limb movement detection logic (PLM/LM) on EMG channels.
+
+    Accepts either pre-processed HDF5 files (legacy CAISR format, see
+    README) or raw EDF recordings. Input format is auto-detected per
+    file based on extension; both code paths produce the same output.
 """
 
 import os
@@ -13,6 +17,7 @@ import glob
 import time
 import argparse
 import multiprocessing
+from math import gcd
 import numpy as np
 import pandas as pd
 from scipy import signal
@@ -22,6 +27,60 @@ from typing import List, Tuple
 sys.path.insert(1, './limb')
 from utils_limb import *
 from utils_docker import *
+# Keep an explicit handle on the H5 loader so the unified dispatcher below
+# can fall back to it when the input is a .h5 file.
+from utils_docker import select_signals_cohort as _select_signals_cohort_h5
+
+# EDF loader (only imported here, not at function call time, so a missing
+# pyedflib install fails fast with a clear error if EDF inputs are present).
+try:
+    from edf_loader_pyedflib import load_edf_for_caisr as _load_edf_for_caisr
+except ImportError:
+    _load_edf_for_caisr = None  # surface a clear error only if EDF input is fed in
+
+
+def _select_signals_cohort_edf(path: str, intermediate_fs: int = 200) -> Tuple[np.ndarray, int]:
+    """EDF counterpart of utils_docker.select_signals_cohort for caisr_limb.
+
+    Loads the two leg-EMG channels (lat, rat), resamples each to
+    ``intermediate_fs`` (default 200 Hz, matching the H5 path), and stacks
+    them into the (n_samples, 2) array the downstream limb pipeline expects.
+    """
+    if _load_edf_for_caisr is None:
+        raise ImportError(
+            "EDF input detected but `pyedflib` is not installed. "
+            "Run `pip install pyedflib` inside the caisr_limb environment."
+        )
+    the_id = os.path.splitext(os.path.basename(path))[0]
+    channel_data, channel_fs = _load_edf_for_caisr(path)
+
+    REQUIRED = ['lat', 'rat']
+    missing = [ch for ch in REQUIRED if ch not in channel_data]
+    if missing:
+        raise ValueError(
+            f'"{the_id}" is missing required EMG channel(s) {missing}. '
+            f'Subject will be skipped.'
+        )
+
+    resampled = []
+    for ch in REQUIRED:
+        sig = np.asarray(channel_data[ch], dtype=np.float64)
+        src_fs = float(channel_fs[ch])
+        if src_fs != float(intermediate_fs):
+            g = gcd(int(intermediate_fs), int(src_fs))
+            sig = resample_poly(sig, int(intermediate_fs) // g, int(src_fs) // g)
+        resampled.append(sig)
+
+    n_samples = min(len(s) for s in resampled)
+    EMGs = np.column_stack([s[:n_samples] for s in resampled])
+    return EMGs, intermediate_fs
+
+
+def select_signals_cohort(path: str):
+    """Unified dispatcher: load limb EMG signals from either an .h5 or .edf file."""
+    if path.lower().endswith('.edf'):
+        return _select_signals_cohort_edf(path)
+    return _select_signals_cohort_h5(path)
 
 def timer(tag: str) -> None:
     print(tag)
@@ -242,14 +301,17 @@ def CAISR_limb(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run CAISR limb movement detection.")
     parser.add_argument("--input_data_dir", type=str, required=True,
-                        help="Folder containing .h5 PSG data files.")
+                        help="Folder containing .h5 and/or .edf PSG data files.")
     parser.add_argument("--output_csv_dir", type=str, required=True,
                         help="Folder where limb CSV outputs will be written.")
     parser.add_argument("--param_dir", type=str, required=True,
                         help="Folder containing 'limb.csv' with run parameters.")
     args = parser.parse_args()
 
-    input_files = glob.glob(os.path.join(args.input_data_dir, '*.h5'))
+    input_files = sorted(
+        glob.glob(os.path.join(args.input_data_dir, '*.h5')) +
+        glob.glob(os.path.join(args.input_data_dir, '*.edf'))
+    )
 
     param_file = os.path.join(args.param_dir, 'limb.csv')
     if not os.path.exists(param_file):
