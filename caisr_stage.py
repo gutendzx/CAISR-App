@@ -1,268 +1,370 @@
-import sys, os, time, glob, warnings, h5py, argparse, logging
+"""
+CAISR Stage: Sleep Staging Module
+Author: Samaneh Nasiri, PhD
+Cleaned/Refactored for Public Repository
+
+Description:
+    Runs the sleep staging model (GraphSleepNet/ProductGraphSleepNet) on PSG
+    input files.
+    Supports both sequential and multiprocessing execution.
+    Accepts either pre-processed .h5 files (legacy CAISR format) or raw .edf
+    recordings; format is auto-detected per file by extension.
+
+Requirements:
+    - Input data must be .h5 and/or .edf in the input directory.
+    - Parameter file (stage.csv) must exist.
+    - Pre-trained model weights must be available in `model_dir`.
+"""
+
+import sys
+import os
+import time
+import glob
+import warnings
+import argparse
+import logging
+import multiprocessing
+from math import gcd
 import numpy as np
 import pandas as pd
-from scipy.signal import resample_poly
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-warnings.filterwarnings("ignore", category=UserWarning)
+import h5py
 import tensorflow as tf
 from tensorflow import keras
+from scipy.signal import resample_poly
 from sklearn.preprocessing import RobustScaler
-from collections import Counter
-from typing import List, Tuple
+
+# Suppress TF warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+warnings.filterwarnings("ignore", category=UserWarning)
 tf.get_logger().setLevel(logging.ERROR)
 
-# Import custom modules
-sys.path.insert(1, './stage/graphsleepnet')
-from DE_PSD import *
-from gcn_features import *
-sys.path.insert(1, './stage')
-from utils_docker import *
-from ProductGraphSleepNet import *
-from utils_model import *
+# --- Local Imports ---
+# NOTE: Ensure the folders 'stage' and 'stage/graphsleepnet' are present in the root directory.
+sys.path.insert(1, 'stage/graphsleepnet')
+sys.path.insert(1, 'stage')
+
+try:
+    from DE_PSD import *
+    from gcn_features import *
+    from utils_docker import *
+    from ProductGraphSleepNet import *
+    from utils_model import *
+    # Keep an explicit handle on the H5 loader so the unified dispatcher below
+    # can fall back to it when the input is a .h5 file.
+    from utils_docker import select_signals_cohort as _select_signals_cohort_h5
+except ImportError as e:
+    print(f"Error importing local modules: {e}")
+    print("Ensure 'stage' and 'stage/graphsleepnet' directories exist and contain required scripts.")
+    sys.exit(1)
+
+# EDF loader (only required when an .edf input is encountered).
+try:
+    from edf_loader_pyedflib import load_edf_for_caisr as _load_edf_for_caisr
+except ImportError:
+    _load_edf_for_caisr = None
+
+
+def _select_signals_cohort_edf(path: str):
+    """EDF counterpart of utils_docker.select_signals_cohort for caisr_stage.
+
+    Returns the same ``(sigs, new_Fs, channels, length_at_200Hz)`` tuple as
+    the H5 loader, so ``process_single_file`` is format-agnostic.
+    """
+    if _load_edf_for_caisr is None:
+        raise ImportError(
+            "EDF input detected but `pyedflib` is not installed. "
+            "Run `pip install pyedflib` inside the caisr_stage environment."
+        )
+    new_Fs = 100
+    Fs = 100
+    period_length_sec = 0.5
+    fs_output_ref = 200
+
+    channel_data, channel_fs = _load_edf_for_caisr(path)
+
+    eeg = ['c3-m2', 'c4-m1']
+    common_sigs = ['e1-m2', 'chin1-chin2', 'abd', 'chest', 'ecg']
+    expected_channels = eeg + common_sigs
+
+    available_channels = set(channel_data.keys())
+    channels_found = [ch for ch in expected_channels if ch in available_channels]
+    channels_missing = [ch for ch in expected_channels if ch not in available_channels]
+
+    if channels_missing:
+        the_id = os.path.splitext(os.path.basename(path))[0]
+        raise ValueError(
+            f"SKIP '{the_id}': missing required channels: {channels_missing}"
+        )
+    if not channels_found:
+        raise ValueError(f"No recognisable channels found in {path}.")
+
+    resampled = {}
+    for ch in channels_found:
+        sig = channel_data[ch].astype(np.float64)
+        src_fs = float(channel_fs[ch])
+        if src_fs != float(new_Fs):
+            g = gcd(int(new_Fs), int(src_fs))
+            sig = resample_poly(sig, int(new_Fs) // g, int(src_fs) // g)
+        resampled[ch] = sig
+
+    n_samples = min(len(v) for v in resampled.values())
+    duration_sec = n_samples / new_Fs
+    length_data = int(duration_sec * fs_output_ref)
+
+    signal_matrix = {
+        ch: (resampled[ch][:n_samples] if ch in resampled else np.zeros(n_samples))
+        for ch in expected_channels
+    }
+    signals = pd.DataFrame(signal_matrix)[expected_channels]
+
+    step = int(Fs * period_length_sec)
+    n_steps = len(signals) // step
+    signals = signals.iloc[: n_steps * step, :]
+
+    sigs = signals[expected_channels].values
+    sigs, _chan_inds = clip_noisy_values(sigs, new_Fs, period_length_sec)
+    sigs = RobustScaler().fit_transform(sigs).T
+
+    return sigs, new_Fs, expected_channels, length_data
+
+
+def select_signals_cohort(path: str):
+    """Unified dispatcher: load + pre-process from either .h5 or .edf."""
+    if path.lower().endswith('.edf'):
+        return _select_signals_cohort_edf(path)
+    return _select_signals_cohort_h5(path)
 
 
 def timer(tag: str) -> None:
-    """
-    Displays a simple progress bar for the given tag, printing dots incrementally for aesthetics.
-    
-    Args:
-    - tag (str): The string label for which the progress bar is shown.
-    """
-
     print(tag)
-    # simple progress bar for aesthetics
     for i in range(1, len(tag) + 1):
         print('.' * i + '     ', end='\r')
-        time.sleep(1.5 / len(tag))  # Time delay proportional to the length of the tag
+        time.sleep(1.5 / len(tag))
     print()
 
-def extract_run_parameters(param_csv: str) -> List[bool]:
-    assert os.path.exists(param_csv), 'run parameter file is not found.'
-    
-    # load run parameters from .csv
+
+def extract_run_parameters(param_csv: str) -> 'tuple[bool, bool]':
+    """Extracts run parameters from a CSV file."""
+    if not os.path.exists(param_csv):
+        raise FileNotFoundError(f'Run parameter file not found at {param_csv}.')
+        
     params = pd.read_csv(param_csv)
     overwrite = params['overwrite'].values[0]
     
-    return overwrite
-
-def set_output_paths(input_paths: List[str], csv_folder: str, overwrite: bool) -> Tuple[List[str], List[str]]:
-    """
-    Sets up output paths for CSV files based on input paths and folders.
+    # Get the multiprocess flag.
+    multiprocess_val = params.get('multiprocess', pd.Series([False])).values[0]
+    multiprocess = str(multiprocess_val).strip().lower() == 'true'
     
-    Args:
-    - input_paths (List[str]): List of input file paths.
-    - csv_folder (str): Folder to save CSV files.
-    - overwrite (bool): Whether to overwrite already processed files.
+    return overwrite, multiprocess
 
-    Returns:
-    - Tuple[List[str], List[str]]: Filtered input paths, CSV paths.
-    """
 
-    total = len(input_paths)
-    # Extract file IDs from input paths
-    IDs = [p.split('/')[-1].split('.')[0] for p in input_paths]
-    # Create corresponding CSV paths
-    csv_paths = [f'{csv_folder}stage/{ID}_stage.csv' for ID in IDs]
-
-    # Ensure the number of paths is consistent
-    assert len(input_paths) == len(csv_paths), 'SETUP ERROR: The number of input and CSV files is not equal.'
-
-    # If overwrite is False, filter out already processed files
+def set_output_paths(input_paths: 'list[str]', csv_folder: str, overwrite: bool) -> 'tuple[list[str], list[str]]':
+    IDs = [p.split(os.sep)[-1].split('.')[0] for p in input_paths]
+    
+    # Ensure output directory exists
+    stage_out_dir = os.path.join(csv_folder, 'stage')
+    os.makedirs(stage_out_dir, exist_ok=True)
+    
+    csv_paths = [os.path.join(stage_out_dir, f'{ID}_stage.csv') for ID in IDs]
+    
+    assert len(input_paths) == len(csv_paths), 'SETUP ERROR: Number of input and CSV files mismatch.'
     input_paths, csv_paths = filter_already_processed_files(input_paths, csv_paths, overwrite)
-
     return input_paths, csv_paths
 
-def filter_already_processed_files(input_paths: List[str], csv_paths: List[str], overwrite: bool) -> Tuple[List[str], List[str]]:
-    """
-    Filters out already processed files, unless overwrite is specified.
-    
-    Args:
-    - input_paths (List[str]): List of input file paths.
-    - csv_paths (List[str]): List of CSV output file paths.
-    - overwrite (bool): Whether to overwrite already processed files.
 
-    Returns:
-    - Tuple[List[str], List[str]]: Updated lists of input, CSV paths.
-    """
-
+def filter_already_processed_files(input_paths: 'list[str]', csv_paths: 'list[str]', overwrite: bool) -> 'tuple[list[str], list[str]]':
     total = len(input_paths)
-    todo_indices = [p for p, path in enumerate(csv_paths) if not os.path.exists(path)]
-
-    # If not overwriting, keep only unprocessed files
     if not overwrite:
-        input_paths, csv_paths = filter_todo_files(input_paths, csv_paths, todo_indices)
-
-    tag = '(overwrite) ' if overwrite else ''
-    print(f'>> {total - len(todo_indices)}/{total} files already processed\n>> {len(input_paths)} to go.. {tag}\n')
-
-    return input_paths, csv_paths
-
-def filter_todo_files(input_paths: List[str], csv_paths: List[str], keep_indices: List[int]) -> Tuple[List[str], List[str]]:
-    """
-    Filters input, CSV paths based on indices of files to process.
+        todo_indices = [i for i, path in enumerate(csv_paths) if not os.path.exists(path)]
+        input_paths = np.array(input_paths)[todo_indices].tolist()
+        csv_paths = np.array(csv_paths)[todo_indices].tolist()
+        processed_count = total - len(todo_indices)
+    else:
+        processed_count = 0 
     
-    Args:
-    - input_paths (List[str]): List of input file paths.
-    - csv_paths (List[str]): List of CSV output file paths.
-    - keep_indices (List[int]): Indices of files to keep for processing.
-
-    Returns:
-    - Tuple[List[str], List[str]]: Filtered lists of input, CSV paths.
-    """
-
-    input_paths = np.array(input_paths)[keep_indices].tolist()
-    csv_paths = np.array(csv_paths)[keep_indices].tolist()
-
+    tag = '(overwrite)' if overwrite else ''
+    print(f'>> {processed_count}/{total} files already processed')
+    print(f'>> {len(input_paths)} files to process {tag}\n')
     return input_paths, csv_paths
 
-def CAISR_stage(in_paths: List[str], save_paths: List[str], model_path: str) -> None:
-    """
-    Main function for processing sleep stage prediction using a trained model.
 
-    Parameters:
-    - input_path (str): List of paths where the signals are stored.
-    - save_path (str): List of strings where the results will be saved.
-    - model_path (str): Path to the pre-trained model weights.
+def process_single_file(path: str, save_path: str, model_path: str, model_params: dict, file_info: 'tuple[int, int]'):
     """
-    # Log the start of the process
+    Processes a single input file for sleep staging.
+    Loads its own model instance to ensure thread/process safety.
+    """
+    num, total = file_info
+    
+    # Unpack parameters
+    opt = model_params['optimizer']
+    regularizer = model_params['regularizer']
+    w, h, context = model_params['w'], model_params['h'], model_params['context']
+    sample_shape = (context, w, h)
+    
+    # Build model
+    model = build_ProductGraphSleepNet(
+        model_params['cheb_k'], model_params['num_of_chev_filters'], model_params['num_of_time_filters'], 
+        model_params['time_conv_strides'], model_params['cheb_polynomials'],
+        model_params['time_conv_kernel'], sample_shape, model_params['num_block'], opt, 
+        model_params['conf_adj'] == 'GL', model_params['GLalpha'], regularizer,
+        model_params['GRU_Cell'], model_params['attn_heads'], model_params['dropout']
+    )
+    
+    weights_file = os.path.join(model_path, 'weights_fold_3.h5')
+    if not os.path.exists(weights_file):
+        print(f"Error: Weights file not found at {weights_file}")
+        return
+
+    model.load_weights(weights_file)
+    
+    the_id = path.split(os.sep)[-1].split('.')[0]
+    tag = the_id if len(the_id) < 21 else the_id[:20] + '..'
+    print(f'(# {num + 1}/{total}) Processing "{tag}" [PID:{os.getpid()}]')
+
+    try:
+        signals, Fs, sig_tages, length_data = select_signals_cohort(path)
+    except Exception as e:
+        print(f'Error loading signals for {tag}: {e}', flush=True)
+        return
+
+    window = 30
+    fs_input = 200
+    
+    try:
+        segs = segment_data_unseen(signals)
+        MYpsd, MYde = graph_feat_extraction_unseen_docker(segs, sig_tages, Fs, window)
+        image = AddContext(MYde, context)
+        image = np.squeeze(np.array(image))
+        
+        # Prediction
+        prediction = model.predict(image, verbose=0) 
+        pred_per_subject = prediction.argmax(axis=1) + 1
+        
+        # Padding predictions to match input length (context window offset)
+        pred_per_subject = np.concatenate([[np.nan] * 3, pred_per_subject, [np.nan] * 3])
+        pred_per_subject = np.repeat(pred_per_subject, window, axis=0) # Expand to seconds/samples if needed
+        
+        nan_row = np.empty((1, prediction.shape[1])); nan_row[:] = np.nan
+        for index in [0, 1, 2]:
+            prediction = np.insert(prediction, index, nan_row, axis=0)
+        for i in range(3):
+            prediction = np.vstack((prediction, nan_row))
+        prediction = np.repeat(prediction, window, axis=0)
+
+        # Create DataFrame
+        t1 = (np.arange(len(prediction)) * fs_input).astype(int)
+        t2 = (np.arange(len(prediction)) + 1) * fs_input
+        
+        df = pd.DataFrame({
+            'start_idx': t1, 'end_idx': t2, 'stage': pred_per_subject,
+            'prob_n3': prediction[:, 0], 'prob_n2': prediction[:, 1],
+            'prob_n1': prediction[:, 2], 'prob_r': prediction[:, 3],
+            'prob_w': prediction[:, 4]
+        })
+        
+        # Ensure output length matches original data length
+        t1_full = (np.arange(length_data / fs_input) * fs_input).astype(int)
+        t2_full = ((np.arange(length_data / fs_input) + 1) * fs_input).astype(int)
+        
+        df_matched = pd.DataFrame({
+            'start_idx': t1_full, 'end_idx': t2_full, 'stage': np.nan,
+            'prob_n3': np.nan, 'prob_n2': np.nan, 'prob_n1': np.nan, 'prob_r': np.nan, 'prob_w': np.nan
+        })
+        
+        # Copy valid predictions into matched dataframe
+        limit = min(len(df), len(df_matched))
+        df_matched.iloc[0:limit] = df.iloc[0:limit]
+        
+        df_matched.to_csv(save_path, index=False)
+        
+    except Exception as error:
+        print(f'({num}) Failure during feature extraction/prediction for {tag}: {error}')
+
+
+def CAISR_stage(in_paths: 'list[str]', save_paths: 'list[str]', model_path: str, multiprocess: bool):
     timer('* Starting "caisr_stage" (created by Samaneh Nasiri, PhD)')
     
-    # Model and training settings
-    model_type = 'graphsleepnet'    # Type of model
-    optimizer = 'adam'              # Optimizer type
-    learn_rate = 0.0001             # Learning rate
-    lr_decay = 0.0                  # Learning rate decay
-    l1, l2 = 0.001, 0.001           # L1 and L2 regularization
+    # --- Define Model Parameters ---
+    try:
+        # Check TF version for optimizer compatibility
+        if keras.optimizers.Adam(learning_rate=0.0001).get_config()['name'] == "adam": 
+             opt = keras.optimizers.Adam(learning_rate=0.0001, decay=0.0, clipnorm=1)
+        else:
+             opt = keras.optimizers.Adam(lr=0.0001, decay=0.0, clipnorm=1)
+    except:
+        opt = keras.optimizers.Adam(learning_rate=0.0001, clipnorm=1)
 
-    # Initialize the optimizer based on the specified type
-    if optimizer == "adam":
-        opt = keras.optimizers.Adam(lr=learn_rate, decay=lr_decay, clipnorm=1)
-    else:
-        raise ValueError('Config: check optimizer')
+    model_params = {
+        'optimizer': opt,
+        'regularizer': keras.regularizers.l1_l2(l1=0.001, l2=0.001),
+        'w': 7, 'h': 9, 'context': 7,
+        'conf_adj': 'GL', 'GLalpha': 0.0,
+        'num_of_chev_filters': 128, 'num_of_time_filters': 128,
+        'time_conv_strides': 1, 'time_conv_kernel': 3,
+        'num_block': 1, 'cheb_k': 3,
+        'cheb_polynomials': None, 'dropout': 0.60,
+        'GRU_Cell': 256, 'attn_heads': 40,
+    }
 
-    # Regularizer for the model
-    regularizer = keras.regularizers.l1_l2(l1=l1, l2=l2)
-
-    # Model parameters
-    w, h, context = 7, 9, 7         # Window size, height, and context for input
-    sample_shape = (context, w, h)  # Shape of the input data
-    conf_adj = 'GL'                 # Graph Laplacian configuration
-    GLalpha = 0.0                   # Alpha value for the GL configuration
-    num_of_chev_filters = 128       # Number of Chebyshev filters
-    num_of_time_filters = 128       # Number of time convolution filters
-    time_conv_strides = 1           # Stride for time convolution
-    time_conv_kernel = 3            # Kernel size for time convolution
-    num_block = 1                   # Number of blocks in the model
-    cheb_k = 3                      # Chebyshev polynomial degree
-    cheb_polynomials = None         # Placeholder for Chebyshev polynomials
-    dropout = 0.60                  # Dropout rate
-    GRU_Cell = 256                  # Number of GRU cells
-    attn_heads = 40                 # Number of attention heads
-
-    # Build the model using the predefined parameters
-    model = build_ProductGraphSleepNet(
-        cheb_k, num_of_chev_filters, num_of_time_filters, time_conv_strides, cheb_polynomials,
-        time_conv_kernel, sample_shape, num_block, opt, conf_adj == 'GL', GLalpha, regularizer,
-        GRU_Cell, attn_heads, dropout
-    )
-
-    # Load pre-trained model weights
-    model.load_weights(os.path.join(model_path, 'weights_fold_3.h5'))
-    
-    # Run over all files
-    for num, (path, save_path) in enumerate(zip(in_paths, save_paths)):
-        each_id = path.split('/')[-1]
-        the_id = each_id[:-3]
-        tag = the_id if len(the_id)<21 else the_id[:20]+'..'
-        print(f'(# {num + 1}/{len(in_paths)}) Processing "{tag}"')
+    # --- Dispatch jobs ---
+    if multiprocess and len(in_paths) > 1:
+        # Use available CPUs, cap at 24 to prevent OOM if model is heavy
+        num_workers = min(24, multiprocessing.cpu_count())
+        print(f">> Multiprocessing enabled. Starting parallel processing with {num_workers} workers...")
         
-        # Attempt to load the signals for each file
-        try:
-            signals, Fs, sig_tages, length_data = select_signals_cohort(path)
-        except Exception as e:
-            print(f'Error loading signals: {e}')
-            continue
+        tasks = [
+            (path, save_path, model_path, model_params, (num, len(in_paths)))
+            for num, (path, save_path) in enumerate(zip(in_paths, save_paths))
+        ]
+        
+        with multiprocessing.Pool(processes=num_workers) as pool:
+            pool.starmap(process_single_file, tasks)
 
-        # Segment the signals for unseen data
-        segs = segment_data_unseen(signals)
-        window = 30  # Window size for feature extraction
-
-        try:
-            # Perform feature extraction
-            MYpsd, MYde = graph_feat_extraction_unseen_docker(segs, sig_tages, Fs, window)
-            image = AddContext(MYde, context)  # Add context to the extracted features
-            image = np.squeeze(np.array(image))  # Squeeze array dimensions
-
-            # Model prediction
-            prediction = model.predict(image)
-            pred_per_subject = prediction.argmax(axis=1) + 1  # Predicted sleep stages
-
-            # Set input frequency and stage length
-            fs_input = 200
-            stage_length = 30
-
-            # Handle padding of predictions for smooth output
-            pred_per_subject = np.concatenate([[np.nan] * 3, pred_per_subject, [np.nan] * 3])
-            pred_per_subject = np.repeat(pred_per_subject, stage_length, axis=0)
-
-            # Pad the prediction probabilities with NaNs
-            nan_row = np.empty((1, prediction.shape[1]))
-            nan_row[:] = np.nan
-            indices = [0, 1, 2]
-            for index in indices:
-                prediction = np.insert(prediction, index, nan_row, axis=0)
-            for i in range(3):
-                prediction = np.vstack((prediction, nan_row))
-            prediction = np.repeat(prediction, stage_length, axis=0)
-
-            # Prepare the dataframe for the output CSV
-            t1 = (np.arange(len(prediction)) * fs_input).astype(int)
-            t2 = (np.arange(len(prediction)) + 1) * fs_input
-            df = pd.DataFrame({
-                'start_idx': t1, 'end_idx': t2, 'stage': pred_per_subject,
-                'prob_n3': prediction[:, 0], 'prob_n2': prediction[:, 1],
-                'prob_n1': prediction[:, 2], 'prob_r': prediction[:, 3],
-                'prob_w': prediction[:, 4]
-            })
-
-            # Match with the signal data length
-            t1 = (np.arange(length_data/ fs_input) * fs_input).astype(int)
-            t2 = ((np.arange(length_data / fs_input) + 1) * fs_input).astype(int)
-            df_matched = pd.DataFrame({
-                'start_idx': t1, 'end_idx': t2, 'stage': np.nan,
-                'prob_n3': np.nan, 'prob_n2': np.nan,
-                'prob_n1': np.nan, 'prob_r': np.nan,
-                'prob_w': np.nan
-            })
-            df_matched.iloc[0:len(df)] = df  # Replace NaN rows with actual data
-
-            # Save the results to a CSV file
-            df_matched.to_csv(save_path, index=False)
-
-        except Exception as error:
-            print(f'({num}) Failure during feature extraction: {error}')
+    else:
+        print(">> Starting sequential processing...")
+        for num, (path, save_path) in enumerate(zip(in_paths, save_paths)):
+            process_single_file(path, save_path, model_path, model_params, (num, len(in_paths)))
     
-    # Log the end of the process
     timer('* Finishing "caisr_stage"')
 
 
 if __name__ == "__main__":
-    # Set up argument parsing
     parser = argparse.ArgumentParser(description="Run CAISR sleep staging.")
-    parser.add_argument("--input_path", type=str, default='./data/', help="Path to the input data folder")
-    parser.add_argument("--save_path", type=str, default='./caisr_output/intermediate/', help="Path to save the output features")
-    parser.add_argument("--model_path", type=str, default='./stage/models/', help="Path to the pre-trained model")
-
-    # Parse the arguments
+    parser.add_argument("--input_data_dir", type=str, required=True, help="Path to the input data folder (containing .h5 files)")
+    parser.add_argument("--output_csv_dir", type=str, required=True, help="Path to save the output features")
+    parser.add_argument("--model_dir", type=str, required=True, help="Path to the pre-trained model directory")
+    parser.add_argument("--param_dir", type=str, required=True, help="Folder containing the run parameters file (stage.csv)")
     args = parser.parse_args()
 
-    # Extract run parameters
-    input_files = glob.glob(args.input_path + '*.h5')
-    overwrite = extract_run_parameters(args.input_path + 'run_parameters/stage.csv')
+    # GPU Check
+    if tf.test.is_built_with_cuda():
+        gpus = tf.config.experimental.list_physical_devices('GPU')
+        if gpus:
+            print(f">> GPU detected: {len(gpus)} device(s)")
+        else:
+            print(">> TensorFlow built with CUDA, but no GPU detected at runtime.")
+    else:
+        print(">> TensorFlow is CPU only.")
 
-    # Set output paths
-    in_paths, save_paths = set_output_paths(input_files, args.save_path, overwrite)
+    input_files = sorted(
+        glob.glob(os.path.join(args.input_data_dir, '*.h5')) +
+        glob.glob(os.path.join(args.input_data_dir, '*.edf'))
+    )
     
-    # Run CAISR stage
-    CAISR_stage(in_paths, save_paths, args.model_path)
+    # Load parameters
+    param_file = os.path.join(args.param_dir, 'stage.csv')
+    if not os.path.exists(param_file):
+         # Create default if missing for user convenience
+         print(f">> Parameter file not found at {param_file}. Creating default.")
+         os.makedirs(args.param_dir, exist_ok=True)
+         pd.DataFrame({'overwrite': [False], 'multiprocess': [False]}).to_csv(param_file, index=False)
 
+    overwrite, multiprocess = extract_run_parameters(param_file)
+    
+    in_paths, save_paths = set_output_paths(input_files, args.output_csv_dir, overwrite)
+    
+    if in_paths:
+        CAISR_stage(in_paths, save_paths, args.model_dir, multiprocess)
+    else:
+        print(">> No files to process.")
+        

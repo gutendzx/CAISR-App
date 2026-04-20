@@ -17,3 +17,7 @@ scipy==1.5.4
 six==1.16.0
 sklearn==0.0
 threadpoolctl==3.1.0
+
+# EDF input support — required when caisr_limb.py is fed .edf files
+# (caisr_limb uses the pyedflib backend in edf_loader_pyedflib.py)
+pyEDFlib>=0.1.30

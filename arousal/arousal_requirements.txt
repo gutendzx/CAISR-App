@@ -177,3 +177,7 @@ xarray==2024.6.0
 xlib==0.21
 yasa==0.6.2
 zipp==3.8.1
+
+# EDF input support — required when caisr_arousal.py is fed .edf files
+# (caisr_arousal uses the edfio backend in edf_loader.py)
+edfio>=0.4.0

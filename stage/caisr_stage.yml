@@ -76,4 +76,7 @@ dependencies:
       - werkzeug==2.0.3
       - wrapt==1.15.0
       - zipp==3.6.0
+      # EDF input support — required when caisr_stage.py is fed .edf files
+      # (caisr_stage uses the pyedflib backend in edf_loader_pyedflib.py)
+      - pyEDFlib>=0.1.30
 prefix: /home/ubuntu/anaconda3/envs/caisr_graph

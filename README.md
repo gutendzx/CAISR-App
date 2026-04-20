@@ -3,6 +3,8 @@
 ## Introduction
 The **CAISR system** is designed to streamline tasks related to sleep data analysis by using Docker containers for ease of use. The primary method of using this system is by downloading pre-built Docker images from our website. However, the Python code used to create these images is also available here for transparency and customization purposes. Users who wish to adapt the system to their own datasets or analysis preferences can rebuild the Docker images with minimal effort.
 
+> **New:** every CAISR module — `caisr_stage.py`, `caisr_arousal.py`, `caisr_resp.py`, `caisr_limb.py` — can be run **natively in Conda, no Docker required**, and now accepts **either pre-processed `.h5` files or raw `.edf` recordings in the same input directory**. Input format is auto-detected per file by extension; the same script processes both. See the [Running CAISR Natively (No Docker)](#running-caisr-natively-no-docker) section.
+
 ## Prerequisites
 - **Docker**: Ensure Docker is installed on your machine. You can download it [here](https://www.docker.com/products/docker-desktop).
 - **Python**: Python 3.7+ should be installed.
@@ -154,6 +156,68 @@ def save_prepared_data(path, signal):
      python caisr.py
      ```
    - The script will automatically load Docker images, run the specified tasks, and output the results into the `caisr_output/` folder.
+
+## Running CAISR Natively (No Docker)
+
+Each of the four CAISR modules (`caisr_stage.py`, `caisr_arousal.py`, `caisr_resp.py`, `caisr_limb.py`) can be run directly from Python inside a Conda environment, with no Docker image required. The same script handles both pre-processed `.h5` files and raw `.edf` recordings — input format is detected per file from the extension, so a single input directory can mix the two if you want.
+
+### How input dispatch works
+
+* `*.h5` files are read as before, matching the [H5 File Specification](#h5-files) above.
+* `*.edf` files are loaded via `edf_loader_pyedflib.py` (used by Stage / Resp / Limb) or `edf_loader.py` (used by Arousal). Both loaders handle channel renaming, bipolar derivations, per-channel resampling to 200 Hz, and unit conversion (signals are returned in Volts to match the H5 convention). Channel aliases live in `channel_table.csv` — to support a new EDF label, append it to the relevant alias row, no code changes needed.
+
+The downstream model, post-processing, and CSV output format are identical regardless of input format.
+
+### 1. Create the Conda environments
+
+Each module has its own dependency set, so create one environment per task:
+
+```bash
+# Sleep staging
+cd stage && conda env create -f caisr_stage.yml && cd ..    # env: caisr_stage
+
+# Arousal detection
+conda create -n caisr_arousal python=3.9 -y
+conda activate caisr_arousal
+pip install -r arousal/arousal_requirements.txt
+conda deactivate
+
+# Respiratory analysis
+conda create -n caisr_resp python=3.9 -y
+conda activate caisr_resp
+pip install -r resp/resp_requirements.txt
+conda deactivate
+
+# Limb movement
+conda create -n caisr_limb python=3.9 -y
+conda activate caisr_limb
+pip install -r limb/limb_requirements.txt
+conda deactivate
+```
+
+The EDF dependencies (`pyEDFlib` for stage / resp / limb, `edfio` for arousal) are already declared in each module's requirements file / env YAML, so the steps above install everything needed for both H5 and EDF input.
+
+### 2. Run the modules
+
+Activate the matching environment and run the script. Point `--input_data_dir` at a folder containing `.h5` files, `.edf` files, or a mix of both:
+
+```bash
+conda activate caisr_stage
+python caisr_stage.py   --input_data_dir ./my_dataset --output_csv_dir ./caisr_output --model_dir ./stage/models --param_dir ./data/run_parameters
+
+conda activate caisr_arousal
+python caisr_arousal.py --input_data_dir ./my_dataset --output_csv_dir ./caisr_output --param_dir ./data/run_parameters
+
+conda activate caisr_resp
+python caisr_resp.py    --input_data_dir ./my_dataset --output_csv_dir ./caisr_output --param_dir ./data/run_parameters
+
+conda activate caisr_limb
+python caisr_limb.py    --input_data_dir ./my_dataset --output_csv_dir ./caisr_output --param_dir ./data/run_parameters
+```
+
+Per-subject CSVs are written to `./caisr_output/{task}/`. You can then aggregate them with the existing combine / report scripts exactly as in the Docker workflow.
+
+---
 
 ## Customization: Adapting Preprocessing and Report Generation
 While the CAISR system is optimized for standard `.edf` files and report formats, users with unique datasets or specific reporting needs can customize the preprocessing and reporting scripts. This flexibility allows you to handle non-standard `.edf` files or tailor the output reports to better suit your research requirements.
