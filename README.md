@@ -416,6 +416,140 @@ For each input data file, CAISR generates the following output:
 ### 5. **Cleanup (Optional)**
 You can optionally clean up Docker images and containers after running the tasks. This will require reloading/rebuilding the Docker images for future runs.
 
+## Running on GPU
+
+Each module's Conda env ships without bundled CUDA libraries. If you want GPU acceleration, install matched CUDA + cuDNN into the env. The cluster's *driver* is forward-compatible, so you can run TF compiled against an older CUDA toolkit on a newer driver — but TF's bundled cuBLAS only has kernels for the GPU compute capabilities it was built against.
+
+| Env | TF version | Required CUDA / cuDNN | Compatible GPU compute |
+| :--- | :--- | :--- | :--- |
+| `caisr_stage` | 1.15.0 (Py 3.6) | `cudatoolkit=10.0` + `cudnn=7.6` | sm_60 (Pascal), **sm_70 (Volta — V100)**, sm_75 (Turing — RTX 20-series, T4) |
+| `caisr_arousal` | 2.8.0 | `cudatoolkit=11.2` + `cudnn=8.1.0` | sm_60–sm_75 *and* sm_80/86/89 (Ampere, Ada — A100, A30, RTX 30/40-series, RTX 6000 Ada) |
+
+`caisr_resp` and `caisr_limb` are rule-based (scipy/numpy) and **do not benefit from a GPU**.
+
+### One-time CUDA install
+
+Install matching CUDA libs into a *clone* of each env (so you can keep CPU-only envs around for non-GPU runs):
+
+```bash
+# Stage — TF 1.15 → only Volta/Turing/Pascal
+conda create -n caisr_stage_gpu --clone caisr_stage
+conda activate caisr_stage_gpu
+conda install -c conda-forge cudatoolkit=10.0 cudnn=7.6
+conda deactivate
+
+# Arousal — TF 2.8 → works on all modern GPUs
+conda create -n caisr_arousal_gpu --clone caisr_arousal
+conda activate caisr_arousal_gpu
+conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1.0
+conda deactivate
+```
+
+At runtime, point TF at the env-local CUDA libs:
+
+```bash
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+```
+
+To verify a GPU is visible to TF:
+
+```bash
+python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+```
+
+If you see `[]`, the env's CUDA libraries don't match your GPU's compute capability — for stage on Ampere/Ada, you'll see `Blas GEMM launch failed` (cuBLAS sm_70 only).
+
+### Stage performance tip
+
+`caisr_stage.py`'s sequential path **builds the TF model once** and reuses it across subjects (saves ~30 s/subject of rebuild + weight reload). On a V100 you should see ~25–50 s/subject steady-state — most of that is CPU-side feature extraction (DE/PSD), not GPU compute.
+
+### Arousal memory stability
+
+`caisr_arousal.py:predict()` calls `tf.keras.backend.clear_session()` at the start of each subject to reset the default TF graph. Without it, model rebuilds accumulate graph nodes across subjects and OOM long-running tasks (~32 GB at ~300 sequential subjects).
+
+## Running at scale with SLURM job arrays
+
+For large cohorts (10k+ recordings), a single sbatch is too slow. Use a job array that slices the input directory across N tasks, each handling subjects whose index-mod-N equals its `SLURM_ARRAY_TASK_ID`. Outputs go to one shared directory; `overwrite=False` makes re-runs idempotent.
+
+### Stage — GPU array (TF 1.15 needs Volta/Turing)
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=stg_array
+#SBATCH --partition=overflow            # Volta is in overflow on this cluster
+#SBATCH --gres=gpu:1
+#SBATCH --constraint=cuda10             # restrict to nodes with the CUDA-10 feature
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=24G
+#SBATCH --time=24:00:00
+#SBATCH --array=0-49
+
+set -euo pipefail
+TASK_ID=$SLURM_ARRAY_TASK_ID
+NTASKS=${SLURM_ARRAY_TASK_COUNT:-50}
+
+REPO=/path/to/CAISR-App
+IN=/path/to/cohort/h5
+OUT=/path/to/output
+SLICE=/scratch/$USER/slices/stg/task_${TASK_ID}
+
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate caisr_stage_gpu
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+
+# Build per-task input slice via symlinks
+rm -rf "$SLICE" && mkdir -p "$SLICE"
+i=0
+for h5 in "$IN"/*.h5; do
+  if [ $((i % NTASKS)) -eq "$TASK_ID" ]; then
+    ln -sfn "$h5" "$SLICE/$(basename "$h5")"
+  fi
+  i=$((i+1))
+done
+
+cd "$REPO"
+python caisr_stage.py \
+  --input_data_dir "$SLICE" \
+  --output_csv_dir "$OUT" \
+  --model_dir      "$REPO/stage/models" \
+  --param_dir      "$REPO/data/run_parameters"
+
+rm -rf "$SLICE"
+```
+
+### Arousal — GPU array (works on Ampere/Ada too)
+
+Same template, but use `caisr_arousal_gpu`, replace `caisr_stage.py` with `caisr_arousal.py`, drop `--model_dir`, and bump `--mem=64G`. If your partition has Ampere/Ada GPUs, drop `--constraint=cuda10`.
+
+### Limb / Resp — CPU sbatch (single node)
+
+Limb and resp are rule-based; submit one CPU sbatch per cohort with `multiprocess=True` (resp uses Ray, limb uses a worker count). No array needed.
+
+### Important: set `multiprocess=False` for GPU array tasks
+
+Each array task gets one GPU. With `multiprocess=True`, the script would spawn many CPU workers, each loading its own TF model into the same GPU — they'd OOM the GPU. Always flip the relevant `data/run_parameters/<task>.csv` to `multiprocess=False` before submitting a GPU array.
+
+### Chaining the full pipeline with dependencies
+
+```bash
+# Stage first
+STG=$(sbatch --parsable stage_array.sbatch)
+# Arousal once stage finishes
+ARO=$(sbatch --parsable --dependency=afterany:$STG arousal_array.sbatch)
+# A second arousal pass to catch subjects whose stage CSV arrived late
+ARO2=$(sbatch --parsable --dependency=afterany:$ARO arousal_array.sbatch)
+# Resp once arousal is fully done (resp loads stage_CAISR + arousal_CAISR per subject)
+RSP=$(sbatch --parsable --dependency=afterany:$ARO2 resp.sbatch)
+# Limb is independent of stage/arousal — fire it in parallel with the chain above
+LMB=$(sbatch --parsable limb.sbatch)
+# Combine after both resp and limb finish
+sbatch --dependency=afterany:$RSP,afterany:$LMB combine.sbatch
+```
+
+### Why two arousal passes?
+
+When stage and arousal arrays run in parallel, an arousal task may pass over a subject whose stage CSV hasn't been written yet — the script logs `No stage file found, skipping`. A second arousal pass with `overwrite=False` picks up only those late-stagers and processes them.
+
 ## Notes
 - **Error Handling**: The script includes basic error handling. If a Docker image cannot be found or loaded, the script will exit with an error message.
 - **Modularity**: You can customize the tasks and their order by modifying the `tasks` list in the script.

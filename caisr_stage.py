@@ -188,35 +188,42 @@ def filter_already_processed_files(input_paths: 'list[str]', csv_paths: 'list[st
     return input_paths, csv_paths
 
 
-def process_single_file(path: str, save_path: str, model_path: str, model_params: dict, file_info: 'tuple[int, int]'):
-    """
-    Processes a single input file for sleep staging.
-    Loads its own model instance to ensure thread/process safety.
-    """
-    num, total = file_info
-    
-    # Unpack parameters
-    opt = model_params['optimizer']
-    regularizer = model_params['regularizer']
-    w, h, context = model_params['w'], model_params['h'], model_params['context']
-    sample_shape = (context, w, h)
-    
-    # Build model
+def _build_stage_model(model_path: str, model_params: dict):
+    """Build ProductGraphSleepNet and load fold-3 weights."""
+    sample_shape = (model_params['context'], model_params['w'], model_params['h'])
     model = build_ProductGraphSleepNet(
-        model_params['cheb_k'], model_params['num_of_chev_filters'], model_params['num_of_time_filters'], 
+        model_params['cheb_k'], model_params['num_of_chev_filters'], model_params['num_of_time_filters'],
         model_params['time_conv_strides'], model_params['cheb_polynomials'],
-        model_params['time_conv_kernel'], sample_shape, model_params['num_block'], opt, 
-        model_params['conf_adj'] == 'GL', model_params['GLalpha'], regularizer,
-        model_params['GRU_Cell'], model_params['attn_heads'], model_params['dropout']
+        model_params['time_conv_kernel'], sample_shape, model_params['num_block'],
+        model_params['optimizer'],
+        model_params['conf_adj'] == 'GL', model_params['GLalpha'], model_params['regularizer'],
+        model_params['GRU_Cell'], model_params['attn_heads'], model_params['dropout'],
     )
-    
     weights_file = os.path.join(model_path, 'weights_fold_3.h5')
     if not os.path.exists(weights_file):
-        print(f"Error: Weights file not found at {weights_file}")
-        return
-
+        raise FileNotFoundError(f"Weights file not found at {weights_file}")
     model.load_weights(weights_file)
-    
+    return model
+
+
+def process_single_file(path: str, save_path: str, model_path: str, model_params: dict, file_info: 'tuple[int, int]', model=None):
+    """
+    Processes a single input file for sleep staging.
+    Builds its own model when ``model`` is None (multiprocess workers); otherwise
+    reuses the caller's pre-built TF model — saves ~30 s per subject in the
+    sequential path by skipping rebuild + weight reload.
+    """
+    num, total = file_info
+
+    if model is None:
+        try:
+            model = _build_stage_model(model_path, model_params)
+        except FileNotFoundError as exc:
+            print(f"Error: {exc}")
+            return
+
+    context = model_params['context']
+
     the_id = path.split(os.sep)[-1].split('.')[0]
     tag = the_id if len(the_id) < 21 else the_id[:20] + '..'
     print(f'(# {num + 1}/{total}) Processing "{tag}" [PID:{os.getpid()}]')
@@ -308,22 +315,31 @@ def CAISR_stage(in_paths: 'list[str]', save_paths: 'list[str]', model_path: str,
 
     # --- Dispatch jobs ---
     if multiprocess and len(in_paths) > 1:
-        # Use available CPUs, cap at 24 to prevent OOM if model is heavy
-        num_workers = min(24, multiprocessing.cpu_count())
+        # Cap at 12 (24 OOMed at ~900 GB on a single node; each TF worker holds ~10 GB).
+        # maxtasksperchild recycles worker procs to release accumulated TF state.
+        num_workers = min(12, multiprocessing.cpu_count())
         print(f">> Multiprocessing enabled. Starting parallel processing with {num_workers} workers...")
-        
+
         tasks = [
             (path, save_path, model_path, model_params, (num, len(in_paths)))
             for num, (path, save_path) in enumerate(zip(in_paths, save_paths))
         ]
-        
-        with multiprocessing.Pool(processes=num_workers) as pool:
+
+        with multiprocessing.Pool(processes=num_workers, maxtasksperchild=20) as pool:
             pool.starmap(process_single_file, tasks)
 
     else:
         print(">> Starting sequential processing...")
+        # Build model ONCE and reuse across subjects — avoids ~30 s/subject of
+        # rebuild + weight-reload overhead.
+        try:
+            shared_model = _build_stage_model(model_path, model_params)
+        except FileNotFoundError as exc:
+            print(f"Error: {exc}")
+            return
+        print(">> Model built once; reusing across all subjects.")
         for num, (path, save_path) in enumerate(zip(in_paths, save_paths)):
-            process_single_file(path, save_path, model_path, model_params, (num, len(in_paths)))
+            process_single_file(path, save_path, model_path, model_params, (num, len(in_paths)), model=shared_model)
     
     timer('* Finishing "caisr_stage"')
 
