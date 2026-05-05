@@ -177,7 +177,8 @@ def set_output_paths(
     filtered input paths, filtered csv paths
     """
     ids = [p.split("/")[-1].split(".")[0] for p in input_paths]
-    csv_paths = [f"{csv_folder}arousal/{id_}_arousal.csv" for id_ in ids]
+    csv_paths = [os.path.join(csv_folder, "arousal", f"{id_}_arousal.csv") for id_ in ids]
+    os.makedirs(os.path.join(csv_folder, "arousal"), exist_ok=True)
     assert len(input_paths) == len(csv_paths), (
         "SETUP ERROR: mismatch between input file count and CSV path count."
     )
@@ -635,6 +636,7 @@ def pre_process_temporal_scaling(
     ]
 
     # --- Load raw signals (H5 or EDF, auto-detected) ---
+    _unit_attr = None
     if file.lower().endswith('.edf'):
         sig_group = _load_arousal_edf_as_sig_group(file, target_fs=200)
     else:
@@ -653,6 +655,14 @@ def pre_process_temporal_scaling(
                 # Materialise to a dict so the h5 file handle can close cleanly.
                 _src = f["signals"] if "signals" in f else f
                 sig_group = {k: np.array(_src[k]) for k in _src.keys()}
+            # Capture voltage-unit hint (e.g. f.attrs['unit_voltage'] = 'V'|'uV').
+            _ua = f.attrs.get("unit_voltage", None)
+            if _ua is not None:
+                try:
+                    _ua = _ua.decode() if isinstance(_ua, bytes) else _ua
+                    _unit_attr = str(_ua).strip().lower().replace("μ", "u")
+                except Exception:
+                    _unit_attr = None
 
     available = set(sig_group.keys())
     missing_idx = [i for i, ch in enumerate(channels) if ch not in available]
@@ -701,6 +711,23 @@ def pre_process_temporal_scaling(
     for i, ch in enumerate(channels):
         src = substitute_map.get(ch, ch)
         data[i, :] = np.squeeze(np.array(sig_group[src]))
+
+    # --- Auto-detect input voltage scale (V vs uV) and convert to V ---
+    # Trust f.attrs['unit_voltage'] if present; otherwise use amplitude.
+    # qli-prepared data is clipped to ~±20 dimensionless, raw V EEG is
+    # ~±1e-3 V, raw uV EEG ranges up to ~±300 uV — so a 99th-percentile
+    # threshold of 30 separates uV from {qli, V} cleanly.
+    VOLTAGE_TYPES = {"EEG", "EYE", "CHIN", "ECG", "CHIN_RAW"}
+    voltage_idxs = [i for i, ct in enumerate(channel_type) if ct in VOLTAGE_TYPES]
+    input_in_uV = False
+    if _unit_attr in ("uv", "microvolt", "microvolts"):
+        input_in_uV = True
+    elif _unit_attr not in ("v", "volt", "volts") and voltage_idxs:
+        sample_p99 = float(np.nanpercentile(np.abs(data[voltage_idxs[0], :]), 99))
+        input_in_uV = sample_p99 > 30
+    if input_in_uV:
+        for i in voltage_idxs:
+            data[i, :] = data[i, :] / 1e6
 
     # --- Detect pre-normalised (qli) vs raw (EDF/HSP) data ---
     # JMLR qli-prepared H5 files are clipped and RobustScaler-normalised to
@@ -803,6 +830,12 @@ def predict(
     DataFrame with columns:
         start_idx, end_idx, arousal, prob_no, prob_arousal, pp_trace
     """
+    # Reset the default TF graph each call. Without this, every model rebuild
+    # adds nodes to the previous graph, accumulating memory across subjects
+    # and OOMing tasks that process more than ~300 sequential files (observed
+    # at ~32 GB).
+    tf.keras.backend.clear_session()
+    import gc; gc.collect()
     hparams = YAMLHParams(HPARAMS_PATH)
     INPUT_HZ = 128
     OUTPUT_HZ = 2
@@ -973,9 +1006,15 @@ def process_single_arousal_file(
             pd.read_csv(hypno_path)["stage"].fillna(5).values.repeat(128)
         )
 
-        # Always run in 2-channel mode (C3-M2 / C4-M1 preferred, fallback applied above)
+        # 6-channel default (frontal+central+occipital); fall back to
+        # 2-channel (C3/C4 only) when frontal/occipital are missing or
+        # otherwise cause predict() to fail.
         with h5.File(temp_h5_path, "r") as hf:
-            df = predict(hf, model_path, channels, hypnogram, EEG_chan=2)
+            try:
+                df = predict(hf, model_path, channels, hypnogram, EEG_chan=6)
+            except Exception as exc6:
+                print(f"  -> 6-chn predict failed for '{display_id}': {exc6}. Falling back to 2-chn.", flush=True)
+                df = predict(hf, model_path, channels, hypnogram, EEG_chan=2)
 
         df.to_csv(write_path, index=False)
 
@@ -1012,14 +1051,16 @@ def CAISR_arousal(
     multiprocess  : bool         If True, use ``multiprocessing.Pool``.
     """
     # PSG channels used for model input (order must match channel_type).
-    # Central EEG (C3-M2, C4-M1) preferred; fallback chain in
-    # pre_process_temporal_scaling handles substitution when absent.
+    # Default = 6-EEG (frontal+central+occipital); pre_process_temporal_scaling
+    # drops F3/F4/O1/O2 when missing (no substitution), so predict() with
+    # EEG_chan=6 will fail-fast and process_single_arousal_file falls back to
+    # EEG_chan=2 using C3-M2 / C4-M1.
     channels = [
-        "c3-m2", "c4-m1",
+        "f3-m2", "f4-m1", "c3-m2", "c4-m1", "o1-m2", "o2-m1",
         "e1-m2", "chin1-chin2", "ecg", "chin1-chin2",
     ]
     channel_type = [
-        "EEG", "EEG",
+        "EEG", "EEG", "EEG", "EEG", "EEG", "EEG",
         "EYE", "CHIN", "ECG", "CHIN_RAW",
     ]
     temporal_resolution = 5  # minutes

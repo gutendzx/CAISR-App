@@ -18,11 +18,42 @@ import time
 import argparse
 import multiprocessing
 from math import gcd
+import h5py
 import numpy as np
 import pandas as pd
 from scipy import signal
 from scipy.signal import resample_poly
 from typing import List, Tuple
+
+
+def _input_is_microvolt(path: str, sample: np.ndarray) -> bool:
+    """
+    Decide whether a CAISR input is stored in microvolts (vs volts).
+    Trust ``f.attrs['unit_voltage']`` when present (H5 only); otherwise
+    fall back to amplitude — EMG in V has 99th-pct |x| ~ 1e-5–1e-4,
+    EMG in uV ~ 10–100. EDF inputs go through the EDF loader which
+    returns Volts, so the amplitude path correctly classifies them.
+    """
+    unit = None
+    if path.lower().endswith('.h5'):
+        try:
+            with h5py.File(path, "r") as f:
+                unit = f.attrs.get("unit_voltage", None)
+        except Exception:
+            unit = None
+    if unit is not None:
+        try:
+            unit = unit.decode() if isinstance(unit, bytes) else unit
+            unit = str(unit).strip().lower().replace("μ", "u")
+        except Exception:
+            unit = None
+    if unit in ("uv", "microvolt", "microvolts"):
+        return True
+    if unit in ("v", "volt", "volts"):
+        return False
+    p99 = float(np.nanpercentile(np.abs(np.asarray(sample)), 99))
+    return p99 > 0.5
+
 
 sys.path.insert(1, './limb')
 from utils_limb import *
@@ -161,7 +192,9 @@ def process_single_limb_file(path: str, save_path: str, file_info: Tuple[int, in
         print(f'ERROR loading signals for "{the_id}": {e}')
         return
     
-    signal_emg = np.array(emg_signal_resampled.T) * 1e6
+    signal_emg = np.array(emg_signal_resampled.T)
+    if not _input_is_microvolt(path, signal_emg):
+        signal_emg = signal_emg * 1e6
     sample_rate = 100
 
     lower_threshold_uV = 2
